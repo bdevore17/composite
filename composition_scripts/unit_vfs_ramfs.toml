@@ -1,0 +1,42 @@
+[system]
+description = "VFS with a RAM file system, exercised by two client components (also checks per-client fd isolation)"
+
+[[components]]
+name = "booter"
+img  = "no_interface.llbooter"
+implements = [{interface = "init"}, {interface = "addr"}]
+deps = [{srv = "kernel", interface = "init", variant = "kernel"}]
+constructor = "kernel"
+
+[[components]]
+name = "capmgr"
+img  = "capmgr.simple"
+deps = [{srv = "booter", interface = "init"}, {srv = "booter", interface = "addr"}]
+implements = [{interface = "capmgr"}, {interface = "init"}, {interface = "memmgr"}, {interface = "capmgr_create"}]
+constructor = "booter"
+
+[[components]]
+name = "sched"
+img  = "sched.pfprr_quantum_static"
+deps = [{srv = "capmgr", interface = "init"}, {srv = "capmgr", interface = "capmgr"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "sched"}, {interface = "init"}]
+constructor = "booter"
+
+[[components]]
+name = "vfs"
+img  = "vfs.ramfs"
+deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "vfs"}]
+constructor = "booter"
+
+[[components]]
+name = "vfstest1"
+img  = "tests.unit_vfs_ramfs"
+deps = [{srv = "vfs", interface = "vfs"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+constructor = "booter"
+
+[[components]]
+name = "vfstest2"
+img  = "tests.unit_vfs_ramfs"
+deps = [{srv = "vfs", interface = "vfs"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+constructor = "booter"
