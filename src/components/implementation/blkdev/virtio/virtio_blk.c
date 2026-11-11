@@ -31,12 +31,12 @@
 #include <blkdev.h>
 #include "virtio_blk.h"
 
-#define VBLK_MAX_PCI_DEVS    64
-#define VBLK_MAX_SEGS        64  /* data segments per request we use at most */
+#define VBLK_MAX_PCI_DEVS 64
+#define VBLK_MAX_SEGS 64           /* data segments per request we use at most */
 #define VBLK_MAX_CLIENT_PAGES 1024 /* largest client buffer: 4 MiB */
-#define PTE_ADDR_MASK        0x000ffffffffff000UL
+#define PTE_ADDR_MASK 0x000ffffffffff000UL
 
-#define mb()  __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define mb() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define cbar() __asm__ __volatile__("" ::: "memory")
 
 struct vblk_client {
@@ -46,22 +46,22 @@ struct vblk_client {
 };
 
 static struct {
-	int                  ready;
-	u16_t                io;        /* I/O port base */
-	u32_t                features;  /* negotiated */
-	u64_t                capacity;  /* sectors */
-	int                  readonly;
-	unsigned int         max_segs;  /* data segments per request */
-	u16_t                qsz;
-	struct vring_desc   *desc;
-	struct vring_avail  *avail;
+	int                         ready;
+	u16_t                       io;       /* I/O port base */
+	u32_t                       features; /* negotiated */
+	u64_t                       capacity; /* sectors */
+	int                         readonly;
+	unsigned int                max_segs; /* data segments per request */
+	u16_t                       qsz;
+	struct vring_desc          *desc;
+	struct vring_avail         *avail;
 	volatile struct vring_used *used;
-	u16_t                last_used;
+	u16_t                       last_used;
 	/* request header and status byte, in DMA-able memory */
 	struct virtio_blk_req_hdr *hdr;
-	volatile u8_t            *status;
-	paddr_t                   hdr_pa, status_pa;
-	unsigned long             nreqs;
+	volatile u8_t             *status;
+	paddr_t                    hdr_pa, status_pa;
+	unsigned long              nreqs;
 } vblk;
 
 static struct vblk_client vblk_clients[MAX_NUM_COMPS];
@@ -136,7 +136,8 @@ vblk_init(void)
 	outb(vblk.io + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
 
 	host_features = inl(vblk.io + VIRTIO_PCI_HOST_FEATURES);
-	vblk.features = host_features & ((1 << VIRTIO_BLK_F_RO) | (1 << VIRTIO_BLK_F_FLUSH) | (1 << VIRTIO_BLK_F_SEG_MAX));
+	vblk.features = host_features
+	                & ((1 << VIRTIO_BLK_F_RO) | (1 << VIRTIO_BLK_F_FLUSH) | (1 << VIRTIO_BLK_F_SEG_MAX));
 	outl(vblk.io + VIRTIO_PCI_GUEST_FEATURES, vblk.features);
 	vblk.readonly = !!(vblk.features & (1 << VIRTIO_BLK_F_RO));
 
@@ -167,11 +168,11 @@ vblk_init(void)
 	}
 	memset(ring, 0, qbytes);
 	memset(req, 0, PAGE_SIZE);
-	vblk.desc  = (struct vring_desc *)ring;
-	vblk.avail = (struct vring_avail *)(ring + sizeof(struct vring_desc) * vblk.qsz);
-	vblk.used  = (struct vring_used *)(ring
-	                                  + round_up_to_page(sizeof(struct vring_desc) * vblk.qsz
-	                                                     + sizeof(u16_t) * (3 + vblk.qsz)));
+	vblk.desc         = (struct vring_desc *)ring;
+	vblk.avail        = (struct vring_avail *)(ring + sizeof(struct vring_desc) * vblk.qsz);
+	vblk.used         = (struct vring_used *)(ring
+                                          + round_up_to_page(sizeof(struct vring_desc) * vblk.qsz
+	                                                             + sizeof(u16_t) * (3 + vblk.qsz)));
 	vblk.avail->flags = VRING_AVAIL_F_NO_INTERRUPT; /* we poll */
 	vblk.hdr          = (struct virtio_blk_req_hdr *)req;
 	vblk.status       = (volatile u8_t *)(req + 64);
@@ -185,10 +186,10 @@ vblk_init(void)
 
 	outb(vblk.io + VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
 	vblk.ready = 1;
-	printc("blkdev.virtio: %02x:%02x.%x io 0x%x, %llu sectors (%llu MiB)%s, queue %u, max %u segments%s\n",
-	       dev.bus, dev.dev, dev.func, vblk.io, (unsigned long long)vblk.capacity,
-	       (unsigned long long)(vblk.capacity >> 11), vblk.readonly ? ", read-only" : "", vblk.qsz,
-	       vblk.max_segs, (vblk.features & (1 << VIRTIO_BLK_F_FLUSH)) ? ", flush" : "");
+	printc("blkdev.virtio: %02x:%02x.%x io 0x%x, %llu sectors (%llu MiB)%s, queue %u, max %u segments%s\n", dev.bus,
+	       dev.dev, dev.func, vblk.io, (unsigned long long)vblk.capacity, (unsigned long long)(vblk.capacity >> 11),
+	       vblk.readonly ? ", read-only" : "", vblk.qsz, vblk.max_segs,
+	       (vblk.features & (1 << VIRTIO_BLK_F_FLUSH)) ? ", flush" : "");
 
 	return 0;
 fail:
@@ -209,16 +210,14 @@ vblk_submit(int ndesc)
 	vblk.desc[ndesc - 1].flags &= ~VRING_DESC_F_NEXT;
 	*vblk.status = 0xff;
 
-	idx                                  = vblk.avail->idx;
-	vblk.avail->ring[idx % vblk.qsz]     = 0;
+	idx                              = vblk.avail->idx;
+	vblk.avail->ring[idx % vblk.qsz] = 0;
 	mb(); /* descriptors and ring entry before the index */
 	vblk.avail->idx = idx + 1;
 	mb(); /* index before the notification */
 	outw(vblk.io + VIRTIO_PCI_QUEUE_NOTIFY, 0);
 
-	while (vblk.used->idx == vblk.last_used) {
-		__asm__ __volatile__("pause" ::: "memory");
-	}
+	while (vblk.used->idx == vblk.last_used) { __asm__ __volatile__("pause" ::: "memory"); }
 	mb(); /* read the status after seeing the completion */
 	vblk.last_used++;
 	vblk.nreqs++;
@@ -239,9 +238,9 @@ desc_set(int i, paddr_t pa, u32_t len, u16_t flags)
 static long
 vblk_rw(struct vblk_client *c, u64_t sector, unsigned long nsect, unsigned long off, int write)
 {
-	u64_t  bytes = (u64_t)nsect * BLKDEV_SECTOR_SIZE;
-	u64_t  done  = 0;
-	int    ret;
+	u64_t bytes = (u64_t)nsect * BLKDEV_SECTOR_SIZE;
+	u64_t done  = 0;
+	int   ret;
 
 	while (done < bytes) {
 		int nd = 1;
@@ -256,9 +255,9 @@ vblk_rw(struct vblk_client *c, u64_t sector, unsigned long nsect, unsigned long 
 			u64_t start = done;
 
 			while (done < bytes && (unsigned int)(nd - 1) < vblk.max_segs) {
-				unsigned long pos  = off + done;
-				unsigned long pg   = pos / PAGE_SIZE;
-				u64_t         len  = PAGE_SIZE - pos % PAGE_SIZE;
+				unsigned long pos = off + done;
+				unsigned long pg  = pos / PAGE_SIZE;
+				u64_t         len = PAGE_SIZE - pos % PAGE_SIZE;
 
 				if (len > bytes - done) len = bytes - done;
 				desc_set(nd++, c->paddrs[pg] + pos % PAGE_SIZE, len, write ? 0 : VRING_DESC_F_WRITE);
@@ -295,7 +294,7 @@ caller(void)
 long
 blkdev_shm_attach(cbuf_t shm, unsigned long npages)
 {
-	struct vblk_client *c = caller();
+	struct vblk_client *c    = caller();
 	vaddr_t             addr = 0;
 	unsigned long       n, i;
 	long                ret = 0;

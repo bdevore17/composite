@@ -31,7 +31,7 @@
 
 /* Size of the per-client shared buffer the client library uses. */
 #define VFS_SHM_PAGES 16
-#define VFS_SHM_SIZE  (VFS_SHM_PAGES * PAGE_SIZE)
+#define VFS_SHM_SIZE (VFS_SHM_PAGES * PAGE_SIZE)
 
 /*
  * Invocation functions. "shm" is the caller's registered buffer.

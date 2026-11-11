@@ -29,14 +29,14 @@
 #include <sys/stat.h>
 #include <unit_vfs_ramfs/vfs_test.h>
 
-#define PDIR      "/disk/persist"
-#define BIG       PDIR "/big.bin"
-#define BIG_SZ    (5 * 1024 * 1024 + 1234) /* reaches cosfs' double-indirect blocks */
-#define BIG_SZ2   (1024 * 1024)            /* after phase 2's truncation */
-#define BIG_SEED  7
-#define HELLO     PDIR "/dir1/dir2/hello.txt"
-#define NLINES    50
-#define NFILES    20
+#define PDIR "/disk/persist"
+#define BIG PDIR "/big.bin"
+#define BIG_SZ (5 * 1024 * 1024 + 1234) /* reaches cosfs' double-indirect blocks */
+#define BIG_SZ2 (1024 * 1024)           /* after phase 2's truncation */
+#define BIG_SEED 7
+#define HELLO PDIR "/dir1/dir2/hello.txt"
+#define NLINES 50
+#define NFILES 20
 #define HOST_FILE "/disk/from_host.txt"
 #define HOST_TEXT "written by the host\n"
 
@@ -82,7 +82,7 @@ check_big(size_t size)
 	struct stat st;
 	FILE       *f;
 	size_t      off = 0, n, i;
-	int         ok = 1;
+	int         ok  = 1;
 
 	if (stat(BIG, &st) || (size_t)st.st_size != size) return 0;
 	f = fopen(BIG, "rb");
@@ -163,9 +163,9 @@ phase1_write(void)
 static void
 phase2_verify_and_modify(void)
 {
-	char name[64];
+	char  name[64];
 	FILE *f;
-	int  i;
+	int   i;
 
 	/* everything from phase 1 survived the reboot */
 	VT_CHECK(check_big(BIG_SZ));

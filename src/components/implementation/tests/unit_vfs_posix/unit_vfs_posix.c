@@ -175,8 +175,10 @@ test_dirs(void)
 		n++;
 		if (de->d_name[0] == 'f') {
 			i = atoi(de->d_name + 1);
-			if (i < 0 || i >= NFILES || seen[i] || de->d_type != DT_REG) bad++;
-			else seen[i] = 1;
+			if (i < 0 || i >= NFILES || seen[i] || de->d_type != DT_REG)
+				bad++;
+			else
+				seen[i] = 1;
 		} else if (strcmp(de->d_name, "sub") || de->d_type != DT_DIR) {
 			bad++;
 		}

@@ -19,11 +19,11 @@
 #include <blkdev.h>
 #include <unit_vfs_ramfs/vfs_test.h>
 
-#define SHM_PAGES   64 /* 256 KiB */
-#define SHM_SIZE    (SHM_PAGES * PAGE_SIZE)
+#define SHM_PAGES 64 /* 256 KiB */
+#define SHM_SIZE (SHM_PAGES * PAGE_SIZE)
 #define MARK_SECTOR 2048
-#define MARK_NSECT  256
-#define MARK_SEED   11
+#define MARK_NSECT 256
+#define MARK_SEED 11
 
 static unsigned char *shm;
 static long           capacity;
