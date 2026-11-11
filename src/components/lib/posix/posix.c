@@ -25,6 +25,14 @@ libc_syscall_override(cos_syscall_t fn, int syscall_num)
 	cos_syscalls[syscall_num] = fn;
 }
 
+cos_syscall_t
+libc_syscall_get(int syscall_num)
+{
+	if (syscall_num < 0 || syscall_num >= SYSCALLS_NUM) return 0;
+
+	return cos_syscalls[syscall_num];
+}
+
 void
 pre_syscall_default_setup()
 {

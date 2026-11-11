@@ -117,6 +117,11 @@ libc_posixsched_initialization_handler()
 }
 
 CWEAKSYMB void
+libc_posixfs_initialization_handler()
+{
+}
+
+CWEAKSYMB void
 libc_tls_init(unsigned int cpuid)
 {
 
@@ -332,6 +337,8 @@ cos_upcall_fn(upcall_type_t t, void *arg1, void *arg2, void *arg3)
 		/* init lib posix variants */
 		libc_posixcap_initialization_handler();
 		libc_posixsched_initialization_handler();
+		/* last: chains to the stdio handlers installed above */
+		libc_posixfs_initialization_handler();
 
 
 		constructors_execute();
