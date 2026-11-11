@@ -103,7 +103,7 @@ kmem_deact_pre(struct cap_header *ch, struct captbl *ct, capid_t pgtbl_cap, capi
 
 	/* get the pte to the cos frame. */
 	*p_pte = pgtbl_lkup_pte(cap_pt->pgtbl, cosframe_addr, &flags);
-	if (!p_pte) cos_throw(err, -EINVAL);
+	if (!*p_pte) cos_throw(err, -EINVAL);
 	old_v = *v = **p_pte;
 
 	pa = old_v & PGTBL_FRAME_MASK;

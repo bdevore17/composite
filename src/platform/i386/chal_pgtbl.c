@@ -23,7 +23,11 @@ chal_pgtbl_flag_add(unsigned long input, pgtbl_flags_t flags)
 unsigned long
 chal_pgtbl_flag_clr(unsigned long input, pgtbl_flags_t flags)
 {
-	return input & (~flags);
+	/*
+	 * pgtbl_flags_t is a 32-bit unsigned enum: ~flags would clear
+	 * the upper 32 bits of the entry (frames above 4GB on x86_64).
+	 */
+	return input & ~(unsigned long)flags;
 }
 
 unsigned long
@@ -349,6 +353,33 @@ chal_pgtbl_lkup_lvl(pgtbl_t pt, vaddr_t addr, word_t *flags, u32_t start_lvl, u3
 #endif
 }
 
+#if defined(__x86_64__)
+/*
+ * Find the last-level entry (PTE) for addr, or NULL if an
+ * intermediate level is not present (unlike chal_pgtbl_lkup_lvl,
+ * which assumes they are).
+ */
+static unsigned long *
+__chal_pgtbl_pte_walk(pgtbl_t pt, vaddr_t addr, word_t *flags)
+{
+	unsigned long *page = chal_pa2va((unsigned long)pt & PGTBL_ENTRY_ADDR_MASK);
+	unsigned long *entry = NULL;
+	u32_t i;
+
+	for (i = 0; i < PGTBL_DEPTH; i++) {
+		vaddr_t a = addr & (0xffffffffffff >> (PGTBL_ENTRY_ORDER * i));
+
+		entry = page + (a >> (PAGE_ORDER + PGTBL_ENTRY_ORDER * (PGTBL_DEPTH - 1 - i)));
+		if (i == PGTBL_DEPTH - 1) break;
+		if (!(*entry & X86_PGTBL_PRESENT)) return NULL;
+		page = chal_pa2va((*entry) & PGTBL_ENTRY_ADDR_MASK);
+	}
+	*flags = (*entry) & PGTBL_FLAG_MASK;
+
+	return entry;
+}
+#endif
+
 int
 chal_pgtbl_mapping_add(pgtbl_t pt, vaddr_t addr, paddr_t page, word_t flags, u32_t order)
 {
@@ -479,6 +510,19 @@ chal_pgtbl_mapping_del(pgtbl_t pt, vaddr_t addr, u32_t liv_id)
 	ret = ltbl_timestamp_update(liv_id);
 	if (unlikely(ret)) goto done;
 
+#if defined(__x86_64__)
+	/* Only 4K user pages on x86_64. Walk the page-table directly (see chal_pgtbl_lkup_pte). */
+	{
+		word_t flags;
+
+		pte = (struct ert_intern *)__chal_pgtbl_pte_walk(pt, addr, &flags);
+		if (!pte) return -EEXIST;
+		orig_v = (unsigned long)(pte->next);
+		if (!(orig_v & X86_PGTBL_PRESENT)) return -EEXIST;
+		if (orig_v & X86_PGTBL_COSFRAME) return -EPERM;
+		order = PAGE_ORDER;
+	}
+#else
 	/* Get the PGD to see if we are deleting a superpage */
 	pte = (struct ert_intern *)__pgtbl_lkupan((pgtbl_t)((unsigned long)pt | X86_PGTBL_PRESENT), addr >> PGTBL_PAGEIDX_SHIFT,
                                                   1, &accum);
@@ -494,6 +538,7 @@ chal_pgtbl_mapping_del(pgtbl_t pt, vaddr_t addr, u32_t liv_id)
 		if (orig_v & X86_PGTBL_COSFRAME) return -EPERM;
 		order = PAGE_ORDER;
 	} else order = SUPER_PAGE_ORDER;
+#endif
 
 	ret = __pgtbl_update_leaf(pte, (void *)(unsigned long)((liv_id << PGTBL_PAGEIDX_SHIFT) | X86_PGTBL_QUIESCENCE), orig_v);
 	if (ret) cos_throw(done, ret);
@@ -573,8 +618,19 @@ chal_pgtbl_lkup(pgtbl_t pt, vaddr_t addr, word_t *flags)
 unsigned long *
 chal_pgtbl_lkup_pte(pgtbl_t pt, vaddr_t addr, word_t *flags)
 {
+#if defined(__x86_64__)
+	/*
+	 * The ertrie lookup (__pgtbl_lkupan) does not find the right
+	 * entry for 4-level page-tables; it returned the PTE of an
+	 * unrelated address, so that releasing a kernel object
+	 * (kmem_deact_*) cleared and zeroed the wrong page. Walk the
+	 * page-table instead.
+	 */
+	return __chal_pgtbl_pte_walk(pt, addr, flags);
+#else
 	return __pgtbl_lkupan((pgtbl_t)((unsigned long)pt | X86_PGTBL_PRESENT), addr >> PGTBL_PAGEIDX_SHIFT, PGTBL_DEPTH,
 	                      flags);
+#endif
 }
 
 unsigned long *
