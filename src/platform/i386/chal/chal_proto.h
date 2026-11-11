@@ -176,10 +176,23 @@ chal_cached_pt_update(pgtbl_t pt, prot_domain_t protdom)
 	tlb_asid_map[get_cpuid()].mapped_pt[PROTDOM_ASID(protdom)] = pt;
 }
 
+/*
+ * Whether CR4.PCIDE is set (chal_cpu_init()).  Without PCIDs, CR3's low
+ * 12 bits are the PWT/PCD cache-control bits and bit 63 is reserved, so
+ * neither the ASID nor CR3_NO_FLUSH may be written into it.
+ */
+extern int chal_pcid_enabled;
+
 /* Update the page table */
 static inline void
 chal_pgtbl_update(struct pgtbl_info *pt)
 {
+	if (unlikely(!chal_pcid_enabled)) {
+		/* Loading CR3 flushes all non-global TLB entries. */
+		asm volatile("mov %0, %%cr3" : : "r"((unsigned long)pt->pgtbl));
+		return;
+	}
+
 	/* lowest 12 bits is the context identifier */
 	unsigned long cr3 = (unsigned long)pt->pgtbl | PROTDOM_ASID(pt->protdom);
 

@@ -12,6 +12,8 @@ u32_t        chal_msr_mhz = 0;
 paddr_t chal_kernel_mem_pa;
 
 struct cpu_tlb_asid_map tlb_asid_map[NUM_CPU];
+int                     chal_pcid_enabled;
+int                     fpu_xsaves_enabled;
 
 void *
 chal_alloc_kern_mem(int order)

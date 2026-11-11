@@ -210,15 +210,18 @@ chal_cpu_init(void)
 
 	if (c & CR4_PCIDE) {
 		cr4 |= CR4_PCIDE;
+		chal_pcid_enabled = 1;
 	} else {
 		/*
-		 * To address the issue where INVLPG may not properly
-		 * flush Global entries on CPUs when PCIDs are enabled,
-		 * Linux disabled PCID for certain Intel CPUs.
-		 * Composite does not use INVLPG feature.
+		 * No PCID (e.g. QEMU without KVM, or some Intel CPUs on
+		 * which Linux disables it because INVLPG may not flush
+		 * global entries with PCIDs on; Composite doesn't use
+		 * INVLPG).  Run without it: every page-table switch
+		 * then flushes the non-global TLB entries, which is
+		 * slower but correct.  See chal_pgtbl_update().
 		 */
-		printk("ERROR: PCID is not supported.\n");
-		assert(0);
+		if (cpu_id == 0) printk("PCID is not supported: page-table switches will flush the TLB.\n");
+		chal_pcid_enabled = 0;
 	}
 
 
@@ -240,15 +243,22 @@ chal_cpu_init(void)
 	a = 0x07;
 	c = 0;
 	chal_cpuid(&a, &b, &c, &d);
-	assert(b & (1 < 5));
+	assert(b & (1 << 5));
 	printk("The CPU supports SSE3, SSE4, AVX, AVX2 and XSAVE\n");
 
 	/* Check if the CPU suppor XSAVEOPT, XSAVEC and XSAVES instructions*/
 	a = 0x0d;
 	c = 1;
 	chal_cpuid(&a, &b, &c, &d);
-	assert((a & (1 << 0)) && (a & (1 << 1)) && (a & (1 << 3)));
-	printk("The CPU supports XSAVEOPT, XSAVEC and XSAVES instructions\n");
+	/* Only XSAVES (bit 3) is used; XSAVEOPT and XSAVEC are not. */
+	if (a & (1 << 3)) {
+		fpu_xsaves_enabled = 1;
+		printk("The CPU supports XSAVES: using XSAVES/XRSTORS\n");
+	} else {
+		/* e.g. QEMU without KVM: fall back to XSAVE/XRSTOR (fpu.h). */
+		fpu_xsaves_enabled = 0;
+		printk("The CPU does not support XSAVES: using XSAVE/XRSTOR\n");
+	}
 
 	/* Get the maximum size of XSAVE area of available XCR0 features */
 	a = 0x0d;

@@ -44,6 +44,9 @@ static inline int           fpu_check_fxsr(void);
 static inline int           fpu_check_sse(void);
 #include "thd.h"
 
+/* Set by chal_cpu_init(): whether the CPU has XSAVES/XRSTORS. */
+extern int fpu_xsaves_enabled;
+
 #if FPU_ENABLED
 static inline int
 fpu_get_info(void)
@@ -185,8 +188,11 @@ static inline void
 fpu_thread_init(struct thread *thd)
 {
 	memset(&thd->fpu, 0, sizeof(struct cos_fpu));
-	/* Have to set bit 63 of xcomp_bv to 1, or it will cause a #GP */
-	thd->fpu.xcomp_bv |= ((u64_t)1 << 63);
+	/*
+	 * XRSTORS needs the compacted format (bit 63 of xcomp_bv set)
+	 * or it raises #GP; plain XRSTOR needs that bit clear.
+	 */
+	if (fpu_xsaves_enabled) thd->fpu.xcomp_bv |= ((u64_t)1 << 63);
 	thd->fpu.cwd = 0x37f;
 #if FPU_SUPPORT_SSE > 0
 	/* 
@@ -296,11 +302,37 @@ xrestors(struct thread *thd)
 #endif
 }
 
+/*
+ * XSAVE/XRSTOR in the standard (non-compacted) format, for CPUs without
+ * XSAVES (e.g. QEMU without KVM).  For the x87, SSE and AVX components
+ * saved here, the standard layout is identical to the compacted one.
+ */
+static inline void
+xsave(struct thread *thd)
+{
+#ifdef __x86_64__
+	asm volatile("xsave64 %0" : "=m"(thd->fpu): "a"(0x7), "d"(0):"memory");
+#else
+	asm volatile("xsave %0" : "=m"(thd->fpu): "a"(0x7), "d"(0):"memory");
+#endif
+}
+
+static inline void
+xrstor(struct thread *thd)
+{
+#ifdef __x86_64__
+	asm volatile("xrstor64 %0" : :"m"(thd->fpu), "a"(0x7), "d"(0):"memory");
+#else
+	asm volatile("xrstor %0" : :"m"(thd->fpu), "a"(0x7), "d"(0):"memory");
+#endif
+}
+
 static inline void
 fpu_save(struct thread *thd)
 {
 #if FPU_SUPPORT_XSAVES
-	xsaves(thd);
+	if (likely(fpu_xsaves_enabled)) xsaves(thd);
+	else                            xsave(thd);
 #else
 	fxsave(thd);
 #endif
@@ -310,7 +342,8 @@ static inline void
 fpu_restore(struct thread *thd)
 {
 #if FPU_SUPPORT_XSAVES
-	xrestors(thd);
+	if (likely(fpu_xsaves_enabled)) xrestors(thd);
+	else                            xrstor(thd);
 #else
 	fxrstor(thd);
 #endif
