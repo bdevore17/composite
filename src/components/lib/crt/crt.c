@@ -876,22 +876,24 @@ crt_thd_create_in(struct crt_thd *t, struct crt_comp *c, thdclosure_index_t clos
 
 	assert(target_ci->comp_cap);
 	capid_t comp_cap = (target_ci->comp_cap_shared) ? target_ci->comp_cap_shared : target_ci->comp_cap;
+	vaddr_t kmem = 0;
 	if (closure_id == 0) {
 		if (target_aep->thd != 0) return -1; /* should not allow double initialization */
 
 		crt_refcnt_take(&c->refcnt);
 		assert(target_ci->comp_cap);
-		thdcap = target_aep->thd = cos_initthd_alloc(ci, comp_cap);
+		thdcap = target_aep->thd = cos_initthd_alloc_kmem(ci, comp_cap, &kmem);
 		assert(target_aep->thd);
 	} else {
 		crt_refcnt_take(&c->refcnt);
-		thdcap = cos_thd_alloc_ext(ci, comp_cap, closure_id);
+		thdcap = cos_thd_alloc_ext_kmem(ci, comp_cap, closure_id, &kmem);
 		assert(thdcap);
 	}
 
 	rs = (struct crt_thd_resources) { .cap = thdcap };
 	if (crt_thd_create_with(t, c, &rs)) BUG();
-	t->tid = cos_introspect(ci, thdcap, THD_GET_TID);
+	t->tid  = cos_introspect(ci, thdcap, THD_GET_TID);
+	t->kmem = kmem;
 
 	return 0;
 }
@@ -925,6 +927,56 @@ crt_thd_alias_in(struct crt_thd *t, struct crt_comp *c, struct crt_thd_resources
 	assert(t && c && res);
 
 	if (crt_alias_alloc_helper(t->cap, CAP_THD, c, &res->cap)) BUG();
+
+	return 0;
+}
+
+/**
+ * Remove a capability that was aliased into component c (e.g. by
+ * crt_thd_alias_in), and release the capability slot for reuse.
+ *
+ * - @c the component whose capability table holds the alias
+ * - @cap the alias' capability id in c
+ * - @type its type (CAP_THD, CAP_ARCV, CAP_ASND, or CAP_SINV)
+ * - @return `0` on success, the kernel error otherwise
+ */
+int
+crt_cap_alias_free(struct crt_comp *c, capid_t cap, cap_t type)
+{
+	assert(c && cap);
+
+	return cos_cap_deactivate(cos_compinfo_get(c->comp_res), cap, type);
+}
+
+/**
+ * Free a thread created by crt_thd_create_in (or as part of a rcv):
+ * deactivate its capability, release its kernel memory, capability
+ * slot, and thread id for reuse. All aliases of the thread capability
+ * must have been removed (crt_cap_alias_free) first, and it must not
+ * be bound to a rcv end-point. Must be called on the thread's core,
+ * and the thread must not be executing (in the kernel's view: it is
+ * not the current thread).
+ *
+ * - @return `0` on success, `-EINVAL` if we don't own the thread's
+ *   memory, the kernel error otherwise.
+ */
+int
+crt_thd_free(struct crt_thd *t)
+{
+	struct cos_compinfo *ci = cos_compinfo_get(cos_defcompinfo_curr_get());
+	struct cos_aep_info *aep;
+	int ret;
+
+	assert(t && t->c);
+	if (!t->kmem) return -EINVAL;
+
+	ret = cos_thd_dealloc(ci, t->cap, t->kmem, t->tid);
+	if (ret) return ret;
+	/* If this was the component's initial thread, a new one can be created */
+	aep = cos_sched_aep_get(t->c->comp_res);
+	if (aep->thd == t->cap) aep->thd = 0;
+	crt_refcnt_release(&t->c->refcnt);
+	*t = (struct crt_thd) { 0 };
 
 	return 0;
 }
@@ -975,6 +1027,19 @@ crt_rcv_create_with(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv_resour
 int
 crt_rcv_create_in(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv *sched, thdclosure_index_t closure_id, crt_rcv_flags_t flags)
 {
+	return crt_rcv_create_in_with_tcap(r, c, sched, closure_id, flags, 0);
+}
+
+/**
+ * crt_rcv_create_in, but use the existing tcap tc (in our capability
+ * table) if it is non-zero, rather than allocating a new one. The
+ * kernel cannot deallocate tcaps, so tcaps from rcvs released with
+ * crt_rcv_free can be reused this way. The tcap must be on the
+ * current core, and not bound to another rcv.
+ */
+int
+crt_rcv_create_in_with_tcap(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv *sched, thdclosure_index_t closure_id, crt_rcv_flags_t flags, tcap_t tc)
+{
 	struct cos_defcompinfo *defci      = cos_defcompinfo_curr_get();
 	struct cos_compinfo    *ci         = cos_compinfo_get(defci);
 	struct cos_compinfo    *target_ci  = cos_compinfo_get(c->comp_res);
@@ -984,6 +1049,7 @@ crt_rcv_create_in(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv *sched, 
 	tcap_t    tcap;
 	thdcap_t  thdcap;
 	arcvcap_t rcvcap;
+	vaddr_t   kmem = 0;
 
 	assert(r && c);
 
@@ -998,14 +1064,14 @@ crt_rcv_create_in(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv *sched, 
 	assert(target_ci->comp_cap);
 	capid_t comp_cap = (target_ci->comp_cap_shared) ? target_ci->comp_cap_shared : target_ci->comp_cap;
 	if (closure_id == 0) {
-		thdcap = cos_initthd_alloc(cos_compinfo_get(defci), comp_cap);
+		thdcap = cos_initthd_alloc_kmem(cos_compinfo_get(defci), comp_cap, &kmem);
 	} else {
-		thdcap = cos_thd_alloc_ext(cos_compinfo_get(defci), comp_cap, closure_id);
+		thdcap = cos_thd_alloc_ext_kmem(cos_compinfo_get(defci), comp_cap, closure_id, &kmem);
 	}
 	assert(thdcap);
 
 	/* Allocate the necessary kernel resources */
-	tcap   = cos_tcap_alloc(ci);
+	tcap   = tc ? tc : cos_tcap_alloc(ci);
 	assert(tcap);
 	rcvcap = cos_arcv_alloc(ci, thdcap, tcap, target_ci->comp_cap, sched_aep->rcv);
 	assert(rcvcap);
@@ -1017,8 +1083,46 @@ crt_rcv_create_in(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv *sched, 
 		.rcv  = rcvcap,
 	};
 	if (crt_rcv_create_with(r, c, &res)) BUG();
+	r->thd.kmem = kmem;
+	r->thd.tid  = cos_introspect(ci, thdcap, THD_GET_TID);
+	r->sched    = sched;
 
 	if (sched) crt_refcnt_take(&sched->refcnt);
+
+	return 0;
+}
+
+/**
+ * Free a rcv end-point created by crt_rcv_create_in: deactivate the
+ * arcv, and free its thread (see crt_thd_free). Its aliases into
+ * other components (crt_rcv_alias_in) and the asnds to it
+ * (crt_asnd_free) must be removed first. The kernel cannot free
+ * tcaps, so the rcv's tcap is returned in tc for reuse (see
+ * crt_rcv_create_in_with_tcap); it remains in our capability table.
+ * Must be called on the rcv's core.
+ *
+ * - @return `0` on success, `-EBUSY` if asnds still reference the rcv,
+ *   the kernel error otherwise.
+ */
+int
+crt_rcv_free(struct crt_rcv *r, tcap_t *tc)
+{
+	struct cos_compinfo *ci = cos_compinfo_get(cos_defcompinfo_curr_get());
+	int ret;
+
+	assert(r && r->aep == &r->local_aep && tc);
+	if (ps_load(&r->refcnt) != CRT_REFCNT_INITVAL) return -EBUSY;
+
+	/* the arcv must be removed first: the kernel won't free a thread bound to it */
+	ret = cos_cap_deactivate(ci, r->local_aep.rcv, CAP_ARCV);
+	if (ret) return ret;
+	*tc = r->local_aep.tc;
+	ret = crt_thd_free(&r->thd);
+	if (ret) return ret;
+
+	/* crt_thd_free released the reference on r->c that crt_rcv_create_in took */
+	if (r->sched) crt_refcnt_release(&r->sched->refcnt);
+	*r = (struct crt_rcv) { 0 };
 
 	return 0;
 }
@@ -1113,6 +1217,25 @@ crt_asnd_alias_in(struct crt_asnd *s, struct crt_comp *c, struct crt_asnd_resour
 	assert(s && c && res);
 
 	if (crt_alias_alloc_helper(s->asnd, CAP_ASND, c, &res->asnd)) BUG();
+
+	return 0;
+}
+
+/**
+ * Free an asnd created with crt_asnd_create, dropping its reference
+ * on the rcv. Its aliases must be removed (crt_cap_alias_free) first.
+ */
+int
+crt_asnd_free(struct crt_asnd *s)
+{
+	struct cos_compinfo *ci = cos_compinfo_get(cos_defcompinfo_curr_get());
+	int ret;
+
+	assert(s && s->asnd && s->rcv);
+	ret = cos_cap_deactivate(ci, s->asnd, CAP_ASND);
+	if (ret) return ret;
+	crt_refcnt_release(&s->rcv->refcnt);
+	*s = (struct crt_asnd) { 0 };
 
 	return 0;
 }

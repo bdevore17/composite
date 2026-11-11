@@ -128,6 +128,7 @@ struct crt_thd {
 	thdcap_t cap;
 	thdid_t  tid;
 	struct crt_comp *c;
+	vaddr_t  kmem;		/* kernel memory of the thread, if we created it (for crt_thd_free) */
 };
 
 struct crt_thd_resources {
@@ -149,6 +150,7 @@ struct crt_rcv {
 
 	struct crt_comp *c;
 	crt_refcnt_t refcnt; 	/* senders create references */
+	struct crt_rcv *sched;	/* scheduler rcv we took a reference on (crt_rcv_create_in) */
 };
 
 struct crt_rcv_resources {
@@ -209,17 +211,33 @@ int crt_sinv_alias_in(struct crt_sinv *s, struct crt_comp *c, struct crt_sinv_re
 
 int crt_asnd_create(struct crt_asnd *s, struct crt_rcv *r);
 int crt_asnd_alias_in(struct crt_asnd *s, struct crt_comp *c, struct crt_asnd_resources *res);
+int crt_asnd_free(struct crt_asnd *s);
 
 typedef cos_thd_fn_t crt_thd_fn_t;
 int crt_rcv_create(struct crt_rcv *r, struct crt_comp *self, crt_thd_fn_t fn, void *data);
 int crt_rcv_create_in(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv *sched, thdclosure_index_t closure_id, crt_rcv_flags_t flags);
 int crt_rcv_create_with(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv_resources *rs);
 int crt_rcv_alias_in(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv_resources *res, crt_rcv_alias_t flags);
+int crt_rcv_create_in_with_tcap(struct crt_rcv *r, struct crt_comp *c, struct crt_rcv *sched, thdclosure_index_t closure_id, crt_rcv_flags_t flags, tcap_t tc);
+int crt_rcv_free(struct crt_rcv *r, tcap_t *tc);
 
 int crt_thd_create(struct crt_thd *t, struct crt_comp *self, crt_thd_fn_t fn, void *data);
 int crt_thd_create_in(struct crt_thd *t, struct crt_comp *c, thdclosure_index_t closure_id);
 int crt_thd_create_with(struct crt_thd *t, struct crt_comp *c, struct crt_thd_resources *rs);
 int crt_thd_alias_in(struct crt_thd *t, struct crt_comp *c, struct crt_thd_resources *res);
+int crt_thd_free(struct crt_thd *t);
+
+/*
+ * Resource release. Capabilities aliased into other components are
+ * removed with crt_cap_alias_free (before the resource itself is
+ * freed), then the resources are released with crt_thd_free,
+ * crt_asnd_free, and crt_rcv_free, in that order of dependency:
+ * asnds before the rcv they send to, the rcv before its thread. The
+ * capability ids and kernel memory are reused (after quiescence) if
+ * the reclamation rings are set up (see cos_capid_reclaim_init and
+ * cos_kmem_reclaim_init).
+ */
+int crt_cap_alias_free(struct crt_comp *c, capid_t cap, cap_t type);
 
 void *crt_page_allocn(struct crt_comp *c, u32_t n_pages);
 int crt_page_aliasn_in(void *pages, u32_t n_pages, struct crt_comp *self, struct crt_comp *c_in, vaddr_t *map_addr);
