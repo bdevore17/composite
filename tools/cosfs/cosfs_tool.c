@@ -29,7 +29,8 @@ usage(void)
 	        "  mkdir  IMG PATH\n"
 	        "  rm     IMG PATH\n"
 	        "  rmdir  IMG PATH\n"
-	        "  verify IMG PATH SIZE SEED check that PATH holds SIZE bytes of the test pattern SEED\n");
+	        "  verify IMG PATH SIZE SEED check that PATH holds SIZE bytes of the test pattern SEED\n"
+	        "  verify-raw IMG OFFSET SIZE SEED  check SIZE raw bytes of IMG at byte OFFSET hold the pattern\n");
 	exit(2);
 }
 
@@ -111,6 +112,25 @@ main(int argc, char **argv)
 		if ((ret = host_dev_open(&hdev, img, sz != 0, sz))) die(img, ret);
 		if ((ret = cosfs_mkfs(&hdev.dev, 0))) die("mkfs", ret);
 		printf("cosfs: %s: %llu blocks of %d bytes\n", img, (unsigned long long)hdev.dev.nblocks, COSFS_BLOCK_SIZE);
+		return 0;
+	}
+	if (!strcmp(cmd, "verify-raw")) {
+		FILE    *f;
+		uint64_t off, size, seed, i;
+		int      c;
+
+		if (argc < 6) usage();
+		off  = strtoull(argv[3], NULL, 0);
+		size = strtoull(argv[4], NULL, 0);
+		seed = strtoull(argv[5], NULL, 0);
+		if (!(f = fopen(img, "rb")) || fseek(f, off, SEEK_SET)) die(img, -errno);
+		for (i = 0; i < size; i++) {
+			if ((c = fgetc(f)) == EOF || (unsigned char)c != cosfs_pattern(i, seed)) {
+				printf("verify-raw %s: FAILED at byte %llu\n", img, (unsigned long long)i);
+				return 1;
+			}
+		}
+		printf("verify-raw %s: OK (%llu bytes at %llu)\n", img, (unsigned long long)size, (unsigned long long)off);
 		return 0;
 	}
 	if (!strcmp(cmd, "fsck")) {

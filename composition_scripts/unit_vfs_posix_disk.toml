@@ -1,0 +1,43 @@
+[system]
+description = "POSIX/stdio file API on the VFS with cosfs on a virtio-blk disk at /disk. Run QEMU with -drive file=<image>,if=virtio,format=raw (a blank image is formatted)"
+
+[[components]]
+name = "booter"
+img  = "no_interface.llbooter"
+implements = [{interface = "init"}, {interface = "addr"}]
+deps = [{srv = "kernel", interface = "init", variant = "kernel"}]
+constructor = "kernel"
+
+[[components]]
+name = "capmgr"
+img  = "capmgr.simple"
+deps = [{srv = "booter", interface = "init"}, {srv = "booter", interface = "addr"}]
+implements = [{interface = "capmgr"}, {interface = "init"}, {interface = "memmgr"}, {interface = "capmgr_create"}, {interface = "contigmem"}]
+constructor = "booter"
+
+[[components]]
+name = "sched"
+img  = "sched.pfprr_quantum_static"
+deps = [{srv = "capmgr", interface = "init"}, {srv = "capmgr", interface = "capmgr"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "sched"}, {interface = "init"}]
+constructor = "booter"
+
+[[components]]
+name = "blkdev"
+img  = "blkdev.virtio"
+deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}, {srv = "capmgr", interface = "contigmem"}]
+implements = [{interface = "blkdev"}]
+constructor = "booter"
+
+[[components]]
+name = "vfs"
+img  = "vfs.diskfs"
+deps = [{srv = "blkdev", interface = "blkdev"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "vfs"}]
+constructor = "booter"
+
+[[components]]
+name = "posixtest"
+img  = "tests.unit_vfs_posix"
+deps = [{srv = "vfs", interface = "vfs"}, {srv = "sched", interface = "sched"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}, {srv = "capmgr", interface = "contigmem"}]
+constructor = "booter"
