@@ -49,9 +49,35 @@ INCBIN(vmlinux, VM_GUEST_IMAGE)
 /* The realmode stub is built here and is not selectable. */
 INCBIN(bios, "guest/guest.img")
 
+/*
+ * Number of vCPUs, set by the composition script like the guest image:
+ *
+ *     constants = [{variable = "VM_GUEST_IMAGE", value = "..."},
+ *                  {variable = "VM_NUM_VCPUS",   value = "4"}]
+ *
+ * vCPU i runs on core i, as a VM thread with its own exit-handler thread, so
+ * the VM may have at most NUM_CPU vCPUs. vCPU 0 is the bootstrap processor;
+ * the others start in wait-for-SIPI and are brought up by the guest with
+ * INIT/SIPI (see vlapic.c and vmrt.c). The guest firmware (vmimg's vmxbooter)
+ * discovers the count through CPUID leaf 0BH and lists that many CPUs in the
+ * MADT.
+ */
+#ifndef VM_NUM_VCPUS
+#define VM_NUM_VCPUS 1
+#endif
+#if VM_NUM_VCPUS < 1 || VM_NUM_VCPUS > NUM_CPU || VM_NUM_VCPUS > VMRT_VM_MAX_VCPU
+#error "VM_NUM_VCPUS must be between 1 and min(NUM_CPU, VMRT_VM_MAX_VCPU)"
+#endif
+
 /* Only one VM component globally managed by this VMM */
 static struct vmrt_vm_comp *g_vm;
-static u8_t g_num_vcpus = 1;  
+static u8_t g_num_vcpus = VM_NUM_VCPUS;
+
+/*
+ * vCPU creation is done by each vCPU's own core, one core at a time (vCPU 0
+ * first); this counts the vCPUs created so far.
+ */
+static volatile u32_t g_vcpus_created = 0;
 
 #define VM_MAX_COMPS (2)
 #define GUEST_MEM_SZ (310*1024*1024)
@@ -167,6 +193,7 @@ vm_comp_create(void)
 	vmrt_vm_data_copy_to(vm, start, sz, GUEST_IMAGE_ADDR);
 
 	ioapic_init(vm);
+	vm->dev_lock.locked = 0;
 
 	printc("Guest(%s) image has been loaded into the VM component\n", vm->name);
 
@@ -188,10 +215,29 @@ cos_init(void)
 	}
 }
 
+/*
+ * Create vCPU `cid` on this core: the kernel binds the vCPU's VM thread and
+ * its VMCS to the core that creates it.
+ */
+static void
+vcpu_create_here(coreid_t cid)
+{
+	struct vmrt_vm_vcpu *vcpu;
+
+	printc("VMM: Initializing vCPU %d on core %d\n", cid, cid);
+	vmrt_vm_vcpu_init(g_vm, cid);
+	vcpu = vmrt_get_vcpu(g_vm, cid);
+	assert(vcpu->coreid == cos_coreid());
+	lapic_init(vcpu);
+	iinst_ctxt_init(vcpu);
+	mmio_init(vcpu);
+	printc("VMM: vCPU %d initialized (tid=%lu), lapic, inst_ctxt, mmio done\n", cid, vcpu->tid);
+}
+
 void
 cos_parallel_init(coreid_t cid, int init_core, int ncores)
 {
-	struct vmrt_vm_vcpu *vcpu;
+	assert(ncores >= g_num_vcpus);
 
 	if (cid == 0) {
 		/*
@@ -212,15 +258,17 @@ cos_parallel_init(coreid_t cid, int init_core, int ncores)
 			g_vm->rx_thd = sched_thd_create(virtio_rx_task, NULL);
 			printc("VMM: Created RX thread, tid=%lu\n", g_vm->rx_thd);
 		}
+	}
 
-		printc("VMM: Initializing vCPU 0 on core %d\n", cid);
-		vmrt_vm_vcpu_init(g_vm, 0);
-		vcpu = vmrt_get_vcpu(g_vm, 0);
-		printc("VMM: vCPU 0 initialized (tid=%lu)\n", vcpu->tid);
-		lapic_init(vcpu);
-		iinst_ctxt_init(vcpu);
-		mmio_init(vcpu);
-		printc("VMM: vCPU 0 lapic, inst_ctxt, mmio initialized\n");
+	if (cid < g_num_vcpus) {
+		/*
+		 * One core at a time, in vCPU order: the capability manager and the
+		 * static slabs are not known to tolerate concurrent VM resource
+		 * creation, and this is a one-off cost at boot.
+		 */
+		while (__atomic_load_n(&g_vcpus_created, __ATOMIC_ACQUIRE) != (u32_t)cid) sched_thd_yield();
+		vcpu_create_here(cid);
+		__atomic_store_n(&g_vcpus_created, cid + 1, __ATOMIC_RELEASE);
 	}
 
 	return;
@@ -235,11 +283,21 @@ parallel_main(coreid_t cid)
 		sched_thd_param_set(g_vm->tx_thd, sched_param_pack(SCHEDP_PRIO, 31));
 	}
 
-	if (cid == 0) {
-		printc("VMM: Starting vCPU 0 on core %d\n", cid);
-		vcpu = vmrt_get_vcpu(g_vm, 0);
-		printc("VMM: Core %d started vCPU %d (tid=%lu)\n", cid, cid, vcpu->tid);
-		vmrt_vm_vcpu_start(vcpu);
+	if (cid < g_num_vcpus) {
+		/* Every vCPU must exist before any of them runs: vCPU 0 sends IPIs to the others. */
+		while (__atomic_load_n(&g_vcpus_created, __ATOMIC_ACQUIRE) != g_num_vcpus) sched_thd_yield();
+		vcpu = vmrt_get_vcpu(g_vm, cid);
+
+		if (cid == 0) {
+			printc("VMM: Starting vCPU 0 (BSP) on core %d (tid=%lu), %d vCPU(s) total\n", cid, vcpu->tid,
+			       g_num_vcpus);
+			vmrt_vm_vcpu_start(vcpu);
+		} else {
+			/* An application processor: runs only once the guest INIT/SIPIs it */
+			printc("VMM: vCPU %d (AP) on core %d waiting for INIT/SIPI\n", cid, cid);
+			vmrt_vcpu_wait_sipi_and_start(vcpu);
+			printc("VMM: Core %d started vCPU %d (tid=%lu)\n", cid, cid, vcpu->tid);
+		}
 	}
 	sched_thd_block(0);
 	/* Should not be here, or there is a bug in the scheduler! */

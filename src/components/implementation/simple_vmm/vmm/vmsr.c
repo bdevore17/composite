@@ -95,9 +95,11 @@ rdmsr_handler(struct vmrt_vm_vcpu *vcpu)
 	}	
 	case MSR_IA32_APIC_BASE:
 	{
-		/* TODO: for non-BSP, the BSP flag should be cleared */
-		/* 0x900 : enable xapic and this is BSP */
-		regs->ax = 0XFEE00000 | 0x900;
+		/*
+		 * 0x800: xAPIC global enable; 0x100: BSP flag, which only the
+		 * bootstrap processor (vCPU 0) may report (SDM Vol.3, "Local APIC Status and Location").
+		 */
+		regs->ax = 0XFEE00000 | 0x800 | (vcpu->cpuid == 0 ? 0x100 : 0);
 		regs->dx = 0;
 		goto done;
 	}
@@ -212,7 +214,8 @@ wrmsr_handler(struct vmrt_vm_vcpu *vcpu)
 		rdtscll(curr_tsc);
 		tsc_future = regs->ax & 0xffffffff;
 		tsc_future |= ((regs->dx & 0xffffffff) << 32);
-		vcpu->next_timer = tsc_future;
+		/* Writing 0 disarms the TSC-deadline timer (SDM Vol.3, "TSC-Deadline Mode") */
+		vcpu->next_timer = tsc_future ? tsc_future : ~0ULL;
 
 		goto done;
 	}

@@ -520,7 +520,12 @@ static inline const struct vcpuid_entry *find_vcpuid_entry(uint32_t leaf_arg, ui
 
 static void guest_cpuid_01h(struct vmrt_vm_vcpu *vcpu, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
 {
-	uint32_t apicid = 1;
+	/*
+	 * Initial APIC ID: must match the vCPU's local APIC ID (vlapic_reset()
+	 * uses the vCPU index) and the guest's MADT, or an SMP guest mixes up its
+	 * CPUs. This was a constant 1, which only one vCPU could get away with.
+	 */
+	uint32_t apicid = vcpu->cpuid;
 
 	cpuid_subleaf(0x1U, 0x0U, eax, ebx, ecx, edx);
 	/* Patching initial APIC ID */
@@ -592,13 +597,49 @@ static void guest_cpuid_01h(struct vmrt_vm_vcpu *vcpu, uint32_t *eax, uint32_t *
 	*edx &= ~CPUID_EDX_DTES;
 }
 
-static void guest_cpuid_0bh(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+static inline uint32_t
+vcpuid_order(uint32_t n)
 {
-	/* Forward host cpu topology to the guest, guest will know the native platform information such as host cpu topology here */
-	cpuid_subleaf(0x0BU, *ecx, eax, ebx, ecx, edx);
+	uint32_t order = 0;
 
-	/* Patching X2APIC */
-	*edx = 1;
+	while ((1U << order) < n) order++;
+	return order;
+}
+
+/*
+ * Leaf 0BH, extended topology (SDM Vol.2A CPUID; Vol.3 "Identifying Logical Processors"): describe the VM
+ * as one package of num_vcpu single-threaded cores whose x2APIC IDs are the
+ * vCPU indices -- the same IDs the guest finds in its MADT and in leaf 01H.
+ * This used to forward the host topology with a constant x2APIC ID of 1,
+ * which made every vCPU claim to be the same CPU. Linux derives its
+ * package/core/thread IDs from this leaf (detect_extended_topology()).
+ *
+ * The VMM's guest firmware (vmimg's vmxbooter) also reads subleaf 1 EBX as
+ * the number of CPUs to list in the MADT.
+ */
+static void guest_cpuid_0bh(struct vmrt_vm_vcpu *vcpu, uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
+{
+	uint32_t subleaf = *ecx & 0xFFU;
+	uint32_t nvcpu   = vcpu->vm->num_vcpu;
+
+	switch (subleaf) {
+	case 0U: /* SMT level: one thread per core */
+		*eax = 0U;
+		*ebx = 1U;
+		*ecx = (1U << 8) | subleaf;
+		break;
+	case 1U: /* Core level: num_vcpu cores per package */
+		*eax = vcpuid_order(nvcpu);
+		*ebx = nvcpu;
+		*ecx = (2U << 8) | subleaf;
+		break;
+	default: /* Invalid level terminates the enumeration */
+		*eax = 0U;
+		*ebx = 0U;
+		*ecx = subleaf;
+		break;
+	}
+	*edx = vcpu->cpuid;
 }
 
 static void guest_cpuid_0dh(uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
@@ -709,7 +750,7 @@ void guest_cpuid(struct vmrt_vm_vcpu *vcpu, uint32_t *eax, uint32_t *ebx, uint32
 			break;
 
 		case 0x0bU:
-			guest_cpuid_0bh(eax, ebx, ecx, edx);
+			guest_cpuid_0bh(vcpu, eax, ebx, ecx, edx);
 			break;
 
 		case 0x0dU:

@@ -1,4 +1,5 @@
 #include "serial.h"
+#include "../../virq.h"
 
 static u8_t serial_data[0x08];
 static u8_t send_intr_enable = 0;
@@ -26,7 +27,7 @@ serial_handler(u16_t port, int dir, int sz, struct vmrt_vm_vcpu *vcpu)
 #if VMX_SUPPORT_POSTED_INTR
 				vlapic_set_intr(vcpu, 34, 0);
 #else
-				lapic_intr_inject(vcpu, 34, 1);
+				virq_raise_legacy(vcpu, VIRQ_GSI_SERIAL, 34, 1);
 #endif
 				serial_data[SERIAL_IIR - SERIAL_PORT_MIN] = 0x2;
 				serial_data[MODEM_STATUS_REGISTER - SERIAL_PORT_MIN] = 0x20;

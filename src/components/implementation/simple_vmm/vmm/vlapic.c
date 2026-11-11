@@ -86,6 +86,7 @@ static void vlapic_x2apic_self_ipi_handler(struct acrn_vlapic *vlapic);
  * sending an 'ipinum' to interrupt the 'hostcpu'.
  */
 static void vlapic_set_error(struct acrn_vlapic *vlapic, uint32_t mask);
+uint64_t vlapic_calc_dest_noshort(struct vmrt_vm_comp *vm, bool is_broadcast, uint32_t dest, bool phys, bool lowprio);
 
 void vlapic_timer_expired(struct vmrt_vm_vcpu *vcpu);
 static struct pi_desc *get_pi_desc(struct vmrt_vm_vcpu *vcpu);
@@ -346,11 +347,23 @@ static void vlapic_accept_intr(struct acrn_vlapic *vlapic, uint32_t vector, bool
 
 	lapic = vlapic->apic_page;
 	if ((lapic->svr.v & APIC_SVR_ENABLE) == 0U) {
-		printc("vlapic is software disabled, ignoring interrupt %u", vector);
-		assert(0);
-	} else {
-		apicv_advanced_accept_intr(vlapic, vector, level);
+		/*
+		 * A software-disabled local APIC does not accept interrupts (SDM
+		 * Vol.3 11.4.7.2); drop it like hardware does. Reading the svr of
+		 * another vCPU's page is a benign race: it is a plain read.
+		 */
+		VMRT_DEBUG("vlapic %u is software disabled, ignoring interrupt %u\n", vlapic2vcpu(vlapic)->cpuid, vector);
+		return;
 	}
+	/*
+	 * Every interrupt -- whoever raises it, on whichever core -- goes through
+	 * the target vCPU's request bitmap and is moved into its virtual-APIC
+	 * page by the target's own handler (vmrt_vcpu_sync_intr()). Level
+	 * triggered interrupts are delivered edge-style: TMR is not maintained
+	 * and there is no EOI broadcast to the vIOAPIC (no EOI-exit bitmap).
+	 */
+	if (level) VMRT_DEBUG("vlapic: level-triggered vector %u delivered as edge\n", vector);
+	vmrt_vcpu_post_intr(vlapic2vcpu(vlapic), (u8_t)vector);
 }
 
 /**
@@ -624,17 +637,59 @@ vlapic_set_error(struct acrn_vlapic *vlapic, uint32_t mask)
 	}
 }
 
+static void vlapic_deliver_ipi(struct acrn_vlapic *src, struct vmrt_vm_vcpu *target, uint32_t mode, uint32_t vec,
+                               uint32_t icr_low)
+{
+	switch (mode) {
+	case APIC_DELMODE_FIXED:
+	case APIC_DELMODE_LOWPRIO:
+		vlapic_set_intr(target, vec, LAPIC_TRIG_EDGE);
+		break;
+	case APIC_DELMODE_INIT:
+		/*
+		 * "INIT level de-assert" (level-triggered INIT without the assert
+		 * bit) is only a synchronization message for the arbitration IDs of
+		 * old APICs; it has no effect on the target (SDM Vol.3, "Interrupt Command Register").
+		 */
+		if ((icr_low & APIC_TRIGMOD_MASK) == APIC_TRIGMOD_LEVEL
+		    && (icr_low & APIC_LEVEL_MASK) == APIC_LEVEL_DEASSERT) {
+			VMRT_DEBUG("vCPU %u: INIT de-assert to vCPU %u ignored\n", vlapic2vcpu(src)->cpuid, target->cpuid);
+			break;
+		}
+		vmrt_vcpu_init_ipi(target);
+		break;
+	case APIC_DELMODE_STARTUP:
+		vmrt_vcpu_sipi(target, (u8_t)vec);
+		break;
+	case APIC_DELMODE_NMI:
+		/* Linux uses NMI IPIs only for backtraces and panic/reboot stops. */
+		printc("vlapic: NMI IPI to vCPU %u not supported, dropped\n", target->cpuid);
+		break;
+	default:
+		printc("vlapic: unsupported ICR delivery mode 0x%x (icr_lo 0x%08x), dropped\n", mode, icr_low);
+		break;
+	}
+}
+
+/*
+ * The guest wrote ICR low: send an IPI (SDM Vol.3, "Interrupt Command Register"). With APIC-register
+ * virtualization the write has already landed in the virtual-APIC page and
+ * this is the trap-like APIC-write VM exit that follows it (SDM Vol.3
+ * 30.4.3.3); ICR high was written (and also trapped) before it.
+ */
 static void vlapic_write_icrlo(struct acrn_vlapic *vlapic)
 {
-	uint16_t vcpu_id;
 	bool phys = false, is_broadcast = false;
-	uint64_t dmask;
+	uint64_t dmask = 0UL;
 	uint32_t icr_low, icr_high, dest;
 	uint32_t vec, mode, shorthand;
 	struct lapic_regs *lapic;
-	struct vmrt_vm_vcpu *target_vcpu;
+	struct vmrt_vm_vcpu *vcpu = vlapic2vcpu(vlapic);
+	struct vmrt_vm_comp *vm = vcpu->vm;
+	uint16_t i;
 
 	lapic = vlapic->apic_page;
+	/* We deliver synchronously, so the IPI is never "send pending". */
 	lapic->icr_lo.v &= ~APIC_DELSTAT_PEND;
 
 	icr_low = lapic->icr_lo.v;
@@ -651,22 +706,45 @@ static void vlapic_write_icrlo(struct acrn_vlapic *vlapic)
 	phys = ((icr_low & APIC_DESTMODE_LOG) == 0UL);
 	shorthand = icr_low & APIC_DEST_MASK;
 
-	if ((mode == APIC_DELMODE_FIXED) && (vec < 16U)) {
+	if (((mode == APIC_DELMODE_FIXED) || (mode == APIC_DELMODE_LOWPRIO)) && (vec < 16U)) {
 		vlapic_set_error(vlapic, APIC_ESR_SEND_ILLEGAL_VECTOR);
-		printc("Ignoring invalid IPI %u", vec);
-		assert(0);
-	} else if (((shorthand == APIC_DEST_SELF) || (shorthand == APIC_DEST_ALLISELF))
-			&& ((mode == APIC_DELMODE_NMI) || (mode == APIC_DELMODE_INIT)
-			|| (mode == APIC_DELMODE_STARTUP))) {
-		printc("unsupported ICR command, ignore it\n");
-	} else {
-		struct vmrt_vm_vcpu *vcpu = vlapic2vcpu(vlapic);
+		printc("vlapic: vCPU %u sent IPI with illegal vector %u, ignored\n", vcpu->cpuid, vec);
+		return;
+	}
+	if (((shorthand == APIC_DEST_SELF) || (shorthand == APIC_DEST_ALLISELF))
+	    && ((mode == APIC_DELMODE_NMI) || (mode == APIC_DELMODE_INIT) || (mode == APIC_DELMODE_STARTUP))) {
+		/* Not a valid combination on real hardware either (SDM Vol.3, "Interrupt Command Register") */
+		printc("vlapic: unsupported ICR command 0x%08x (self INIT/SIPI/NMI), ignored\n", icr_low);
+		return;
+	}
 
-		printc(
-			"icrlo 0x%08x icrhi 0x%08x triggered ipi %u",
-				icr_low, icr_high, vec);
-
+	switch (shorthand) {
+	case APIC_DEST_NOSHORT:
+		if (is_broadcast) {
+			dmask = (vm->num_vcpu >= 64) ? ~0UL : ((1UL << vm->num_vcpu) - 1);
+		} else {
+			dmask = vlapic_calc_dest_noshort(vm, false, dest, phys, mode == APIC_DELMODE_LOWPRIO);
+		}
+		break;
+	case APIC_DEST_SELF:
+		dmask = 1UL << vcpu->cpuid;
+		break;
+	case APIC_DEST_ALLISELF:
+		dmask = (vm->num_vcpu >= 64) ? ~0UL : ((1UL << vm->num_vcpu) - 1);
+		break;
+	case APIC_DEST_ALLESELF:
+		dmask = ((vm->num_vcpu >= 64) ? ~0UL : ((1UL << vm->num_vcpu) - 1)) & ~(1UL << vcpu->cpuid);
+		break;
+	default:
 		assert(0);
+	}
+
+	VMRT_DEBUG("vCPU %u: IPI icr_lo 0x%08x icr_hi 0x%08x -> vCPU mask 0x%lx\n", vcpu->cpuid, icr_low, icr_high,
+	           dmask);
+
+	for (i = 0U; i < vm->num_vcpu; i++) {
+		if ((dmask & (1UL << i)) == 0UL) continue;
+		vlapic_deliver_ipi(vlapic, vmrt_get_vcpu(vm, i), mode, vec, icr_low);
 	}
 }
 
@@ -940,7 +1018,7 @@ vlapic_set_intr(struct vmrt_vm_vcpu *vcpu, uint32_t vector, bool level)
 	vlapic = vcpu_vlapic(vcpu);
 	if (vector < 16U) {
 		vlapic_set_error(vlapic, APIC_ESR_RECEIVE_ILLEGAL_VECTOR);
-		assert(0);
+		VMRT_INFO("vlapic %u: received illegal vector %u, dropped\n", vcpu->cpuid, vector);
 	} else {
 		vlapic_accept_intr(vlapic, vector, level);
 	}
@@ -1244,8 +1322,8 @@ static uint16_t vm_apicid2vcpu_id(struct vmrt_vm_comp *vm, uint32_t lapicid)
 	}
 
 	if (cpu_id == INVALID_CPU_ID) {
-		printc("%s: bad lapicid %u", __func__, lapicid);
-		assert(0);
+		/* Hardware silently drops messages to absent APIC IDs. */
+		VMRT_INFO("%s: no vCPU with APIC ID %u\n", __func__, lapicid);
 	}
 
 	return cpu_id;
@@ -1331,11 +1409,9 @@ vlapic_calc_dest_noshort(struct vmrt_vm_comp *vm, bool is_broadcast,
 
 	if (is_broadcast) {
 		/* Broadcast in both logical and physical modes. */
-		printc("Broadcast is not supported now\n");
-		assert(0);
+		dmask = (vm->num_vcpu >= 64) ? ~0UL : ((1UL << vm->num_vcpu) - 1);
 	} else if (phys) {
 		/* Physical mode: "dest" is local APIC ID. */
-		printc("vlapic phy dst mode to find cpu\n");
 		set_dest_mask_phys(vm, &dmask, dest);
 	} else {
 		/*
@@ -1412,7 +1488,10 @@ vlapic_receive_intr(struct vmrt_vm_comp *vm, bool level, uint32_t dest, bool phy
 					} else {
 						vlapic_set_intr(target_vcpu, vec, level);
 					}
-				} else {assert(0);}
+				} else {
+					/* A disabled local APIC drops the message (SDM Vol.3, "Local APIC State After It Has Been Software Disabled") */
+					VMRT_DEBUG("vlapic %u disabled, dropping ioapic vector %u\n", vcpu_id, vec);
+				}
 			}
 		}
 	}
@@ -1487,6 +1566,9 @@ int32_t apic_write_vmexit_handler(struct vmrt_vm_vcpu *vcpu)
 		break;
 	case APIC_OFFSET_ICR_LOW:
 		vlapic_write_icrlo(vlapic);
+		break;
+	case APIC_OFFSET_ICR_HI:
+		/* Only latched in the virtual-APIC page; used by the next ICR low write. */
 		break;
 	case APIC_OFFSET_CMCI_LVT:
 	case APIC_OFFSET_TIMER_LVT:

@@ -163,6 +163,146 @@ vmrt_vm_vcpu_init(struct vmrt_vm_comp *vm, u32_t vcpu_nr)
 
 	vcpu->next_timer = ~0ULL;
 
+	memset((void *)vcpu->pending_intr, 0, sizeof(vcpu->pending_intr));
+	/*
+	 * The BSP is started by the VMM directly; every other vCPU behaves like
+	 * an application processor after power-on: it waits for INIT/SIPI.
+	 */
+	__atomic_store_n(&vcpu->run_state, vcpu_nr == 0 ? VMRT_VCPU_STARTING : VMRT_VCPU_WAIT_SIPI, __ATOMIC_RELEASE);
+	VMRT_INFO("vCPU %u created on core %u (vcpu tid %lu, handler tid %lu)\n", vcpu_nr, vcpu->coreid, vcpu->tid,
+	          vcpu->handler_tid);
+}
+
+void
+vmrt_spin_lock(struct vmrt_spinlock *l)
+{
+	unsigned long spins = 0;
+
+	while (__atomic_exchange_n(&l->locked, 1, __ATOMIC_ACQUIRE)) {
+		while (__atomic_load_n(&l->locked, __ATOMIC_RELAXED)) {
+			__asm__ volatile("pause" ::: "memory");
+			/* The holder may be a preempted thread on this very core. */
+			if (++spins % 4096 == 0) sched_thd_yield();
+		}
+	}
+}
+
+void
+vmrt_spin_unlock(struct vmrt_spinlock *l)
+{
+	assert(l->locked);
+	__atomic_store_n(&l->locked, 0, __ATOMIC_RELEASE);
+}
+
+void
+vmrt_vcpu_post_intr(struct vmrt_vm_vcpu *vcpu, u8_t vector)
+{
+	assert(vcpu && vcpu->vm);
+	if (unlikely(vector < 16)) {
+		/* Vectors 0-15 are illegal for fixed interrupts (SDM Vol.3, "Valid Interrupt Vectors") */
+		VMRT_INFO("vCPU %u: dropping interrupt with illegal vector %u\n", vcpu->cpuid, vector);
+		return;
+	}
+	__atomic_fetch_or(&vcpu->pending_intr[vector / 64], 1ULL << (vector % 64), __ATOMIC_RELEASE);
+	VMRT_DEBUG("vCPU %u: interrupt %u requested from core %u\n", vcpu->cpuid, vector, cos_coreid());
+}
+
+void
+vmrt_vcpu_sync_intr(struct vmrt_vm_vcpu *vcpu)
+{
+	int w;
+
+	/* Only the vCPU's own handler, on the vCPU's core, owns its vAPIC page. */
+	assert(vcpu->coreid == cos_coreid());
+	for (w = 0; w < VMRT_INTR_WORDS; w++) {
+		u64_t bits;
+
+		if (likely(__atomic_load_n(&vcpu->pending_intr[w], __ATOMIC_RELAXED) == 0)) continue;
+		bits = __atomic_exchange_n(&vcpu->pending_intr[w], 0, __ATOMIC_ACQ_REL);
+		while (bits) {
+			int b = __builtin_ctzll(bits);
+
+			bits &= bits - 1;
+			lapic_intr_inject(vcpu, (u8_t)(w * 64 + b), 0);
+		}
+	}
+}
+
+void
+vmrt_vcpu_clear_intr(struct vmrt_vm_vcpu *vcpu)
+{
+	int w;
+
+	for (w = 0; w < VMRT_INTR_WORDS; w++) __atomic_store_n(&vcpu->pending_intr[w], 0, __ATOMIC_RELEASE);
+}
+
+void
+vmrt_vcpu_init_ipi(struct vmrt_vm_vcpu *vcpu)
+{
+	u32_t state = __atomic_load_n(&vcpu->run_state, __ATOMIC_ACQUIRE);
+
+	if (state != VMRT_VCPU_WAIT_SIPI) {
+		/*
+		 * INIT of a vCPU that already runs (e.g. guest CPU offlining) would
+		 * need a full vCPU reset, which is not supported. Linux only does
+		 * this for CPU hot-unplug, which this VMM does not offer.
+		 */
+		VMRT_INFO("vCPU %u: INIT ignored (vCPU is %s)\n", vcpu->cpuid,
+		          state == VMRT_VCPU_RUNNING ? "running" : "starting");
+		return;
+	}
+	/* INIT resets the local APIC: nothing requested before it survives. */
+	vmrt_vcpu_clear_intr(vcpu);
+	VMRT_INFO("vCPU %u: INIT, waiting for SIPI\n", vcpu->cpuid);
+}
+
+void
+vmrt_vcpu_sipi(struct vmrt_vm_vcpu *vcpu, u8_t vector)
+{
+	u32_t expected = VMRT_VCPU_WAIT_SIPI;
+
+	/*
+	 * A SIPI is only acted upon in the wait-for-SIPI state; the second SIPI
+	 * of the usual INIT-SIPI-SIPI sequence (and any later one) is ignored,
+	 * as on hardware (SDM Vol.3, "MP Initialization").
+	 */
+	vcpu->sipi_vector = vector;
+	if (__atomic_compare_exchange_n(&vcpu->run_state, &expected, VMRT_VCPU_STARTING, 0, __ATOMIC_ACQ_REL,
+	                                __ATOMIC_ACQUIRE)) {
+		VMRT_INFO("vCPU %u: SIPI vector 0x%x, starting at 0x%x\n", vcpu->cpuid, vector, (u32_t)vector << 12);
+	} else {
+		VMRT_DEBUG("vCPU %u: SIPI 0x%x ignored (not waiting for SIPI)\n", vcpu->cpuid, vector);
+	}
+}
+
+void
+vmrt_vcpu_wait_sipi_and_start(struct vmrt_vm_vcpu *vcpu)
+{
+	struct vm_vcpu_shared_region *sr = vcpu->shared_region;
+	u32_t vector;
+
+	assert(vcpu->coreid == cos_coreid());
+	assert(vcpu->cpuid != 0);
+
+	/*
+	 * Nothing else runs on this core until the guest starts this vCPU, so
+	 * polling with yields costs nothing but an otherwise idle core.
+	 */
+	while (__atomic_load_n(&vcpu->run_state, __ATOMIC_ACQUIRE) != VMRT_VCPU_STARTING) sched_thd_yield();
+
+	vector = vcpu->sipi_vector;
+	assert(vector <= 0xFF);
+
+	/* Real-mode entry for the SIPI vector, consumed by the kernel on VM launch */
+	sr->init_cs_sel  = (u64_t)vector << 8;
+	sr->init_cs_base = (u64_t)vector << 12;
+	sr->init_rip     = 0;
+	sr->ip           = 0;
+	__atomic_store_n(&sr->init_valid, VM_VCPU_INIT_VALID, __ATOMIC_RELEASE);
+
+	vmrt_vcpu_clear_intr(vcpu);
+	VMRT_INFO("vCPU %u: starting on core %u at %x:0000\n", vcpu->cpuid, cos_coreid(), (u32_t)vector << 8);
+	vmrt_vm_vcpu_start(vcpu);
 }
 
 void
@@ -203,7 +343,7 @@ vmrt_vm_create(struct vmrt_vm_comp *vm, char *name, u8_t num_vcpu, u64_t vm_mem_
 	assert(lapic_access_page);
 	vm->lapic_access_page = lapic_access_page;
 
-	assert(num_vcpu < VMRT_VM_MAX_VCPU);
+	assert(num_vcpu >= 1 && num_vcpu <= VMRT_VM_MAX_VCPU);
 	vm->num_vcpu = num_vcpu;
 	vm->guest_mem_sz = vm_mem_sz;  
 
@@ -472,6 +612,8 @@ vmrt_handle_reason(struct vmrt_vm_vcpu *vcpu, u64_t reason)
 void
 vmrt_vm_vcpu_start(struct vmrt_vm_vcpu *vcpu)
 {
+	assert(vcpu->coreid == cos_coreid());
+	__atomic_store_n(&vcpu->run_state, VMRT_VCPU_RUNNING, __ATOMIC_RELEASE);
 	/* This is actually just to "push" the vcpu handler thread into run queue. */
 	sched_thd_param_set(vcpu->handler_tid, sched_param_pack(SCHEDP_PRIO, 31));
 }
@@ -506,5 +648,7 @@ vmrt_vm_exception_handler(void *_vcpu)
 #if VMX_SUPPORT_POSTED_INTR
 		vlapic_inject_intr(vcpu);
 #endif
+		/* Deliver what other vCPUs, the vIOAPIC and device threads requested */
+		vmrt_vcpu_sync_intr(vcpu);
 	}
 }

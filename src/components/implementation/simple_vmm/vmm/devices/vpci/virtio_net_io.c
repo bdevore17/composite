@@ -32,6 +32,7 @@
 #include "virtio_net_io.h"
 #include "vpci.h"
 #include "virtio_ring.h"
+#include "../../virq.h"
 #include <sync_lock.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
@@ -117,7 +118,7 @@ vq_endchains(struct vmrt_vm_vcpu *vcpu, struct virtio_vq_info *vq, int used_all_
 #if VMX_SUPPORT_POSTED_INTR
 		vlapic_set_intr(vcpu, 33, 0);
 #else
-		lapic_intr_inject(vcpu, 33, 0);
+		virq_raise_legacy(vcpu, VIRQ_GSI_VIRTIO_NET, 33, 0);
 #endif
 	}
 

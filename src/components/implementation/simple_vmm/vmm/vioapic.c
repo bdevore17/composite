@@ -64,7 +64,7 @@ vioapic_generate_intr(struct acrn_single_vioapic *vioapic, uint32_t pin)
 	rte = vioapic->rtbl[pin];
 
 	if (rte.bits.intr_mask == IOAPIC_RTE_MASK_SET) {
-		printc("ioapic pin%hhu: masked\n", pin);
+		VMRT_DEBUG("ioapic pin%u: masked, interrupt dropped\n", pin);
 	} else {
 		phys = (rte.bits.dest_mode == IOAPIC_RTE_DESTMODE_PHY);
 		delmode = rte.bits.delivery_mode;
@@ -192,9 +192,13 @@ vioapic_set_irqline_nolock(const struct vmrt_vm_comp *vm, uint32_t vgsi, uint32_
 void
 vioapic_set_irqline_lock(const struct vmrt_vm_comp *vm, uint32_t vgsi, uint32_t operation)
 {
-	uint64_t rflags;
+	struct acrn_single_vioapic *vioapic;
+	uint32_t pin;
 
+	vioapic = vgsi_to_vioapic_and_vpin(vm, vgsi, &pin);
+	vmrt_spin_lock(&vioapic->lock);
 	vioapic_set_irqline_nolock(vm, vgsi, operation);
+	vmrt_spin_unlock(&vioapic->lock);
 }
 
 static uint32_t
@@ -500,6 +504,7 @@ vioapic_init(struct vmrt_vm_comp *vm)
 		vioapic->chipinfo = vioapic_info[vioapic_index];
 
 		vioapic->vm = vm;
+		vioapic->lock.locked = 0;
 		reset_one_vioapic(vioapic);
 	}
 
@@ -533,6 +538,7 @@ int32_t vioapic_mmio_access_handler(struct vmrt_vm_vcpu *vcpu)
 	if (mmio->size == 4UL) {
 		uint32_t data = (uint32_t)mmio->value;
 
+		vmrt_spin_lock(&vioapic->lock);
 		if (mmio->direction == ACRN_IOREQ_DIR_READ) {
 			vioapic_mmio_rw(vioapic, gpa, &data, true);
 			mmio->value = (uint64_t)data;
@@ -541,6 +547,7 @@ int32_t vioapic_mmio_access_handler(struct vmrt_vm_vcpu *vcpu)
 		} else {
 			ret = -EINVAL;
 		}
+		vmrt_spin_unlock(&vioapic->lock);
 	} else {
 		printc("All RW to IOAPIC must be 32-bits in size\n");
 		assert(0);

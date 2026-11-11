@@ -6,6 +6,55 @@
 #define VMRT_VM_NAME_SIZE (32)
 #define VMRT_VM_MAX_VCPU (16)
 
+/*
+ * VMM-side logging. Level 0 = errors only, 1 = notable events (vCPU startup,
+ * INIT/SIPI, device setup), 2 = per-event debug (every IPI, every virtio
+ * request). Override with -DVMRT_LOG_LEVEL=<n> or a composition constant.
+ */
+#ifndef VMRT_LOG_LEVEL
+#define VMRT_LOG_LEVEL 1
+#endif
+#define VMRT_LOG(lvl, fmt, args...)                                       \
+	do {                                                              \
+		if ((lvl) <= VMRT_LOG_LEVEL) printc("[vmm] " fmt, ##args); \
+	} while (0)
+#define VMRT_INFO(fmt, args...)  VMRT_LOG(1, fmt, ##args)
+#define VMRT_DEBUG(fmt, args...) VMRT_LOG(2, fmt, ##args)
+
+/*
+ * A minimal spinlock for VMM state shared by vCPU handler threads that run on
+ * different cores (device models, the vIOAPIC). Threads on the *same* core can
+ * also contend (e.g. the virtio-net RX thread and vCPU 0's handler), so the
+ * slow path yields to the scheduler instead of spinning forever against a
+ * preempted holder.
+ */
+struct vmrt_spinlock {
+	volatile u32_t locked;
+};
+#define VMRT_SPINLOCK_INIT { .locked = 0 }
+void vmrt_spin_lock(struct vmrt_spinlock *l);
+void vmrt_spin_unlock(struct vmrt_spinlock *l);
+
+/*
+ * vCPU run states, for INIT/SIPI emulation (SDM Vol.3, "MP Initialization", "Interrupt Command Register").
+ *
+ *   UNINIT    -- not created yet
+ *   WAIT_SIPI -- an application processor after (virtual) power-on or INIT:
+ *                its vCPU thread exists but is never run
+ *   STARTING  -- a STARTUP IPI arrived (sipi_vector is valid); the vCPU's
+ *                own core picks this up and starts the vCPU
+ *   RUNNING   -- executing guest code (or in its exit handler)
+ */
+enum vmrt_vcpu_run_state {
+	VMRT_VCPU_UNINIT = 0,
+	VMRT_VCPU_WAIT_SIPI,
+	VMRT_VCPU_STARTING,
+	VMRT_VCPU_RUNNING,
+};
+
+/* Words in a 256-bit interrupt-vector bitmap */
+#define VMRT_INTR_WORDS (256 / 64)
+
 struct vmrt_vm_vcpu {
 	struct vm_vcpu_shared_region *shared_region;
 	u64_t next_timer;
@@ -38,6 +87,23 @@ struct vmrt_vm_vcpu {
 	vm_lapicaccesscap_t lapic_access_cap;
 	vm_vmcb_t vmcb_cap;
 	thdid_t handler_tid;
+
+	/* enum vmrt_vcpu_run_state; changed with atomics, see vmrt_vcpu_*() */
+	volatile u32_t run_state;
+	/* STARTUP IPI vector, valid in VMRT_VCPU_STARTING */
+	volatile u32_t sipi_vector;
+
+	/*
+	 * Interrupts requested for this vCPU by anyone (other vCPUs' IPIs, the
+	 * vIOAPIC, device threads), one bit per vector. Only the vCPU's own
+	 * handler thread moves them into its virtual-APIC page (IRR + RVI), and
+	 * it does so only while the guest is stopped, right before VM entry
+	 * (vmrt_vcpu_sync_intr()). This is a software stand-in for the posted
+	 * interrupt descriptor's PIR: nobody else may write another vCPU's
+	 * virtual-APIC page, because the processor updates it concurrently
+	 * while that vCPU runs (SDM Vol.3, "Virtual-APIC Page").
+	 */
+	volatile u64_t pending_intr[VMRT_INTR_WORDS];
 };
 
 struct vmrt_vm_comp {
@@ -56,6 +122,9 @@ struct vmrt_vm_comp {
 	thdid_t tx_thd;
 	thdid_t rx_thd;
 
+	/* Serializes guest-visible device emulation across vCPUs (port I/O, MMIO). */
+	struct vmrt_spinlock dev_lock;
+
 	int wire_mode;
 	u16_t vm_mac_id;
 };
@@ -71,11 +140,38 @@ void vmrt_vm_vcpu_init(struct vmrt_vm_comp *vm, u32_t vcpu_nr);
 void vmrt_vm_vcpu_resume(struct vmrt_vm_vcpu *vcpu);
 void vmrt_vm_data_copy_to(struct vmrt_vm_comp *vm, char *image, u64_t size, paddr_t gpa);
 void vmrt_vm_exception_handler(void *vcpu);
+/*
+ * Make the vCPU runnable. vmrt_vm_vcpu_init() and vmrt_vm_vcpu_start() must
+ * be called on the core the vCPU is to run on: the kernel binds a vCPU
+ * thread (and its VMCS) to the core that created it.
+ */
 void vmrt_vm_vcpu_start(struct vmrt_vm_vcpu *vcpu);
 paddr_t vmrt_vm_gva2gpa(struct vmrt_vm_vcpu *vcpu, vaddr_t gva);
 static inline struct vmrt_vm_vcpu *vmrt_get_vcpu(struct vmrt_vm_comp *vm, u32_t vcpu_nr) { assert(vcpu_nr < vm->num_vcpu);return &vm->vcpus[vcpu_nr]; }
 
 void lapic_intr_inject(struct vmrt_vm_vcpu *vcpu, u8_t vector, int autoeoi);
+
+/*
+ * Request interrupt `vector` on `vcpu`. Safe from any thread on any core. It
+ * takes effect at that vCPU's next VM entry: a halted or spinning vCPU exits
+ * on HLT/PAUSE and picks it up immediately, a vCPU running guest code picks
+ * it up at its next VM exit (at the latest the next host timer interrupt or
+ * guest timer reprogramming). See vm_fixme.md ("Interrupt delivery latency").
+ */
+void vmrt_vcpu_post_intr(struct vmrt_vm_vcpu *vcpu, u8_t vector);
+/* Called only by the vCPU's own handler thread, with the guest stopped */
+void vmrt_vcpu_sync_intr(struct vmrt_vm_vcpu *vcpu);
+/* Drop all requested-but-undelivered interrupts (INIT) */
+void vmrt_vcpu_clear_intr(struct vmrt_vm_vcpu *vcpu);
+
+/* INIT/SIPI emulation; the guest-visible side lives in the VMM's vlapic */
+void vmrt_vcpu_init_ipi(struct vmrt_vm_vcpu *vcpu);
+void vmrt_vcpu_sipi(struct vmrt_vm_vcpu *vcpu, u8_t vector);
+/*
+ * Run on an application processor vCPU's own core: wait until the guest sent
+ * the vCPU a STARTUP IPI, then start it at the SIPI vector's entry point.
+ */
+void vmrt_vcpu_wait_sipi_and_start(struct vmrt_vm_vcpu *vcpu);
 
 #define INCBIN(name, file) \
     __asm__( \

@@ -54,7 +54,11 @@
  */
 
 struct acrn_single_vioapic {
-	// spinlock_t	lock;
+	/*
+	 * Guards ioregsel/rtbl/pin_state: with several vCPUs, one vCPU can
+	 * program a redirection entry while another core raises a pin.
+	 */
+	struct vmrt_spinlock lock;
 	struct vmrt_vm_comp  *vm;
 	struct ioapic_info chipinfo;
 	uint32_t	ioregsel;

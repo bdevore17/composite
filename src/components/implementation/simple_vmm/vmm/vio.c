@@ -92,6 +92,13 @@ io_handler(struct vmrt_vm_vcpu *vcpu)
 		VM_PANIC(vcpu);
 		
 	}
+	/*
+	 * Device models keep global state (the serial registers, PCI CF8, virtio
+	 * queues), and with several vCPUs their handlers run concurrently on
+	 * different cores; serialize them.
+	 */
+	vmrt_spin_lock(&vcpu->vm->dev_lock);
+
 	if (port_id <= SERIAL_PORT_MAX && port_id >= SERIAL_PORT_MIN) {
 		serial_handler(port_id, access_dir, access_sz, vcpu);
 		goto done;
@@ -152,6 +159,7 @@ io_handler(struct vmrt_vm_vcpu *vcpu)
 
 	unhandled_port(port_id, access_dir, access_sz, vcpu);
 done:
+	vmrt_spin_unlock(&vcpu->vm->dev_lock);
 	GOTO_NEXT_INST(regs);
 	
 	return;
