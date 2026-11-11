@@ -1,0 +1,261 @@
+From 51772bed10c1a6e645eda8c8f1deac7464803838 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 05:05:11 +0000
+Subject: [PATCH] Multi-CPU MADT, virtio-blk driver, smp-blk self-test recipe
+
+For Composite simple_vmm's multi-vCPU and virtio-blk support:
+
+- vmxbooter: list as many CPUs in the MADT as the VMM reports (CPUID leaf
+  0BH subleaf 1, core level), up to MAX_CPU = 16, when running under
+  simple_vmm (hypervisor bit + its ACRN CPUID signature); one CPU
+  anywhere else, as before. The I/O APIC entry now follows the last
+  local APIC entry, and the MADT is zeroed as a whole (the memset used
+  sizeof of the pointer).
+- defconfig: CONFIG_BLK_DEV, CONFIG_VIRTIO_BLK and CONFIG_EXT2_FS, so
+  every image can use the VMM's virtio-blk disk as /dev/vda.
+- recipes/smp-blk: boots into a self-test that checks all CPUs came
+  online, runs one worker per CPU, and does a raw write/read-back and an
+  ext2 mkfs/mount/remount round trip on /dev/vda, printing SMPBLK
+  PASS/FAIL lines, then gives a shell.
+
+Tested under plain QEMU (TCG, -smp 2, QEMU's legacy virtio-blk-pci):
+SMPBLK DONE: 0 failure(s). Not tested under simple_vmm (needs VT-x).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YA4RSTF4ZQjZipvcZwi7Rv
+---
+ README.md                       |  2 +-
+ configs/vmxbooter_defconfig     |  4 +-
+ programs/scripts/run_smp_blk.sh | 69 +++++++++++++++++++++++++++++++++
+ recipes/smp-blk.toml            |  8 ++++
+ vmxbooter/kmain.c               | 60 +++++++++++++++++++++++++---
+ 5 files changed, 135 insertions(+), 8 deletions(-)
+ create mode 100755 programs/scripts/run_smp_blk.sh
+ create mode 100644 recipes/smp-blk.toml
+
+diff --git a/README.md b/README.md
+index 5d009a3..01f7c3f 100644
+--- a/README.md
++++ b/README.md
+@@ -73,7 +73,7 @@ branch so the same image can boot under plain QEMU without Composite.
+ | **Console** | VT + getty + tty layer | A single `uart8250` serial port at `0x3f8`, plus a patch routing fd 0/1 writes straight to `printk` |
+ | **Kernel** | Hundreds of drivers, modules everywhere, initrd for storage | Near-monolithic; modules on only for the benchmark `.ko`s |
+ | **Boot artifact** | `bzImage` + `initrd` on an ESP | A flat multiboot2 blob, `.incbin`'d into a userspace VMM component |
+-| **SMP** | All cores | One vCPU by default (`NUM_CPU 1` in `kmain.c`) |
++| **SMP** | All cores | As many CPUs as the VMM reports (CPUID leaf 0BH under simple_vmm's ACRN signature, up to `MAX_CPU` in `kmain.c`); one CPU anywhere else |
+ 
+ ### There are no kernel patches
+ 
+diff --git a/configs/vmxbooter_defconfig b/configs/vmxbooter_defconfig
+index 471ac48..557575a 100644
+--- a/configs/vmxbooter_defconfig
++++ b/configs/vmxbooter_defconfig
+@@ -140,7 +140,8 @@ CONFIG_PCI=y
+ # CONFIG_STANDALONE is not set
+ # CONFIG_PREVENT_FIRMWARE_BUILD is not set
+ # CONFIG_DMIID is not set
+-# CONFIG_BLK_DEV is not set
++CONFIG_BLK_DEV=y
++CONFIG_VIRTIO_BLK=y
+ CONFIG_NETDEVICES=y
+ CONFIG_DUMMY=y
+ CONFIG_GENEVE=y
+@@ -216,3 +217,4 @@ CONFIG_DEVTMPFS=y
+ # 'bool "ISA-style DMA support" if (X86_64 && EXPERT)' and we set EXPERT=y, so
+ # it is selectable. Nothing in these images uses ISA DMA.
+ # CONFIG_ISA_DMA_API is not set
++CONFIG_EXT2_FS=y
+diff --git a/programs/scripts/run_smp_blk.sh b/programs/scripts/run_smp_blk.sh
+new file mode 100755
+index 0000000..f953f40
+--- /dev/null
++++ b/programs/scripts/run_smp_blk.sh
+@@ -0,0 +1,69 @@
++#!/bin/sh
++# Self-test for simple_vmm's multi-vCPU and virtio-blk support.
++# Every check prints "SMPBLK PASS: ..." or "SMPBLK FAIL: ...", and the run
++# ends with "SMPBLK DONE: <n> failure(s)". The CPUs the firmware listed
++# (simple_vmm's VM_NUM_VCPUS, via the MADT) are /sys/.../cpu/present; all of
++# them must come online. Compare nproc with VM_NUM_VCPUS by eye.
++fails=0
++# The initramfs has no /tmp; keep scratch files in a tmpfs of our own.
++W=/run/smpblk
++mkdir -p $W && mount -t tmpfs tmpfs $W
++pass() { echo "SMPBLK PASS: $*"; }
++fail() { echo "SMPBLK FAIL: $*"; fails=$((fails + 1)); }
++
++echo "cos-vmimg: SMP + virtio-blk self-test"
++
++# --- CPUs ---------------------------------------------------------------------
++ncpu=$(nproc)
++present=$(cat /sys/devices/system/cpu/present)
++online=$(cat /sys/devices/system/cpu/online)
++echo "SMPBLK INFO: nproc=$ncpu present=$present online=$online"
++grep -E '^(processor|apicid|initial apicid|core id|cpu cores)' /proc/cpuinfo
++dmesg | grep -E 'smp: Brought up|smpboot|CPU[0-9]+.*(failed|stuck|dead)'
++[ "$present" = "$online" ] && pass "all present CPUs ($present) online" || fail "present $present, online $online"
++# IPIs: run one busy process per CPU and
++# make sure they all finish (exercises reschedule/function-call IPIs).
++i=0
++while [ $i -lt "$ncpu" ]; do
++	( n=0; while [ $n -lt 20000 ]; do n=$((n + 1)); done ) &
++	i=$((i + 1))
++done
++wait && pass "ran $ncpu concurrent workers"
++grep -E 'CAL|RES|TLB|LOC' /proc/interrupts
++
++# --- virtio-blk ---------------------------------------------------------------
++dmesg | grep -i -E 'virtio|vda|smp|apic'
++if [ ! -b /dev/vda ]; then
++	fail "/dev/vda missing"
++else
++	pass "/dev/vda present: $(cat /sys/block/vda/size) sectors"
++	grep -E 'vda|virtio' /proc/interrupts
++
++	# raw write + read back, past the first MB
++	dd if=/dev/urandom of=$W/pattern bs=4096 count=256 2>/dev/null
++	dd if=$W/pattern of=/dev/vda bs=4096 seek=256 conv=fsync 2>/dev/null
++	echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
++	dd if=/dev/vda of=$W/readback bs=4096 skip=256 count=256 2>/dev/null
++	if cmp $W/pattern $W/readback; then pass "raw 1MB write/read-back"; else fail "raw read-back differs"; fi
++
++	# filesystem round trip
++	if mkfs.ext2 -q /dev/vda; then pass "mkfs.ext2"; else fail "mkfs.ext2"; fi
++	mkdir -p /mnt/vda
++	if mount -t ext2 /dev/vda /mnt/vda; then
++		pass "mount"
++		cp $W/pattern /mnt/vda/pattern
++		sync
++		umount /mnt/vda
++		mount -t ext2 /dev/vda /mnt/vda
++		if cmp $W/pattern /mnt/vda/pattern; then pass "file survives remount"; else fail "file differs after remount"; fi
++		df -h /mnt/vda
++		umount /mnt/vda
++	else
++		fail "mount"
++	fi
++	rm -f $W/pattern $W/readback
++fi
++umount $W
++
++echo "SMPBLK DONE: $fails failure(s)"
++exec /bin/sh
+diff --git a/recipes/smp-blk.toml b/recipes/smp-blk.toml
+new file mode 100644
+index 0000000..46662ed
+--- /dev/null
++++ b/recipes/smp-blk.toml
+@@ -0,0 +1,8 @@
++# Self-checking image for Composite simple_vmm's multi-vCPU and virtio-blk
++# support: reports the CPUs it found and exercises /dev/vda (raw write/read
++# back, mkfs.ext2, mount, file round trip), printing PASS/FAIL lines, then
++# drops to a shell. Compose it with VM_NUM_VCPUS > 1 to test SMP.
++description = "SMP + virtio-blk self-test"
++init        = "run_smp_blk.sh"
++programs    = []
++modules     = []
+diff --git a/vmxbooter/kmain.c b/vmxbooter/kmain.c
+index a31fa04..f181c03 100644
+--- a/vmxbooter/kmain.c
++++ b/vmxbooter/kmain.c
+@@ -1,6 +1,10 @@
+ #include "boot_protocol.h"
+ 
+-#define NUM_CPU 1
++/*
++ * The MADT has room for MAX_CPU local APICs; how many are listed is decided at
++ * boot by guest_ncpus().
++ */
++#define MAX_CPU 16
+ 
+ struct acpi_table_rsdp {
+ 	char signature[8];	/* ACPI signature, contains "RSD PTR " */
+@@ -58,7 +62,7 @@ struct acpi_madt_io_apic {
+ 
+ struct acpi_madt {
+ 	struct acpi_table_madt madt;
+-	struct acpi_madt_local_apic lapics[NUM_CPU];
++	struct acpi_madt_local_apic lapics[MAX_CPU];
+ 	struct acpi_madt_io_apic ioapic;
+ } __attribute__((packed));
+ 
+@@ -148,10 +152,48 @@ static __u8 compute_checksum(__u8 *buffer, __u32 length)
+ void apic_init(struct acpi_table_rsdt *rsdt);
+ void acpi_init(struct acpi_table_rsdp *rsdp);
+ 
++static inline void
++cpuid_count(__u32 leaf, __u32 subleaf, __u32 *a, __u32 *b, __u32 *c, __u32 *d)
++{
++	asm volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(subleaf));
++}
++
++/*
++ * How many CPUs to put in the MADT.
++ *
++ * Under Composite's simple_vmm the VMM decides the vCPU count (VM_NUM_VCPUS
++ * in the composition script) and reports it as the core count of CPUID leaf
++ * 0BH subleaf 1, alongside its hypervisor signature at leaf 0x40000000.
++ * Anywhere else -- plain QEMU via `make run`, which does not emulate this --
++ * keep the historical single CPU.
++ */
++static unsigned int
++guest_ncpus(void)
++{
++	__u32 a, b, c, d;
++	unsigned int n;
++
++	cpuid_count(1, 0, &a, &b, &c, &d);
++	if (!(c & (1U << 31))) return 1; /* no hypervisor */
++
++	cpuid_count(0x40000000, 0, &a, &b, &c, &d);
++	/* simple_vmm reuses ACRN's CPUID emulation and its signature */
++	if (b != 0x4e524341 || c != 0x4e524341 || d != 0x4e524341) return 1; /* "ACRN" x3 */
++
++	cpuid_count(0, 0, &a, &b, &c, &d);
++	if (a < 0xb) return 1;
++	cpuid_count(0xb, 1, &a, &b, &c, &d);
++	n = b & 0xffff;
++	/* subleaf 1 must describe the core level (type 2) */
++	if (((c >> 8) & 0xff) != 2 || n < 1) return 1;
++
++	return n > MAX_CPU ? MAX_CPU : n;
++}
++
+ void apic_init(struct acpi_table_rsdt *rsdt)
+ {
+ 	memset(rsdt, 0, sizeof(*rsdt));
+-	memset(g_madt, 0, sizeof(g_madt));
++	memset(g_madt, 0, sizeof(*g_madt));
+ 
+ 	memcpy(&rsdt->header.signature, "RSDT", 4);
+ 	rsdt->header.length = sizeof(struct acpi_table_rsdt);
+@@ -171,9 +213,15 @@ void apic_init(struct acpi_table_rsdt *rsdt)
+ 	madt->address = 0xFEE00000;
+ 	madt->flags = 0;
+ 
+-	madt->header.length = sizeof(struct acpi_table_madt) + sizeof(struct acpi_madt_local_apic) * NUM_CPU + sizeof(struct acpi_madt_io_apic) ;
++	unsigned int ncpu = guest_ncpus();
++
++	/*
++	 * The I/O APIC entry follows the ncpu local APIC entries directly: the
++	 * MADT is a packed list, so it must not sit after all MAX_CPU slots.
++	 */
++	madt->header.length = sizeof(struct acpi_table_madt) + sizeof(struct acpi_madt_local_apic) * ncpu + sizeof(struct acpi_madt_io_apic) ;
+ 
+-	for (int i = 0; i < NUM_CPU; i++) {
++	for (unsigned int i = 0; i < ncpu; i++) {
+ 		struct acpi_madt_local_apic *lapic = &g_madt->lapics[i];
+ 		lapic->header.type = 0;
+ 		lapic->header.length = sizeof(struct acpi_madt_local_apic);
+@@ -182,7 +230,7 @@ void apic_init(struct acpi_table_rsdt *rsdt)
+ 		lapic->lapic_flags = 1;
+ 	}
+ 
+-	struct acpi_madt_io_apic *ioapic = &g_madt->ioapic;
++	struct acpi_madt_io_apic *ioapic = (struct acpi_madt_io_apic *)&g_madt->lapics[ncpu];
+ 	ioapic->header.type = 1;
+ 	ioapic->header.length = sizeof(struct acpi_madt_io_apic);
+ 	ioapic->id = 0x03;
+-- 
+2.43.0
+
