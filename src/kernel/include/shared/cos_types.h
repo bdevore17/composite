@@ -174,6 +174,12 @@ typedef enum {
 	CAPTBL_OP_HW_TLBSTALL_RECOUNT,
 
 	CAPTBL_OP_ULK_MEMACTIVATE,
+	/*
+	 * hw cap: has every core flushed its TLB since the given
+	 * timestamp? Returns 1 if so, 0 otherwise. See
+	 * CAPTBL_OP_HW_TLBFLUSH, which starts such a flush.
+	 */
+	CAPTBL_OP_HW_TLB_QUIESCENT,
 
 } syscall_op_t;
 

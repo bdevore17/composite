@@ -146,6 +146,8 @@ chal_pgtbl_kmem_act(pgtbl_t pt, vaddr_t addr, unsigned long *kern_addr, unsigned
 	return 0;
 }
 
+extern volatile int ncpus;
+
 int
 chal_tlb_quiescence_check(u64_t timestamp)
 {
@@ -163,19 +165,20 @@ chal_tlb_quiescence_check(u64_t timestamp)
 		 * If no periodic flush done yet, did the
 		 * mandatory flush happen on all cores?
 		 */
-		for (i = 0; i < NUM_CPU_COS; i++) {
+		/*
+		 * Every booted core must have flushed after the
+		 * unmap. (NUM_CPU_COS excludes a core reserved for
+		 * Linux on other platforms; on x86_64 all ncpus cores
+		 * run Composite.) Failing this check is the normal
+		 * case while memory waits for quiescence, so don't
+		 * print here.
+		 */
+		for (i = 0; i < ncpus; i++) {
 			if (timestamp > tlb_quiescence[i].last_mandatory_flush) {
 				/* no go */
 				quiescent = 0;
 				break;
 			}
-		}
-	}
-	if (quiescent == 0) {
-		printk("from cpu %d, t %llu: cpu %d last mandatory flush: %llu\n", get_cpuid(), timestamp, i,
-		       tlb_quiescence[i].last_mandatory_flush);
-		for (i = 0; i < NUM_CPU_COS; i++) {
-			printk("cpu %d: flush %llu\n", i, tlb_quiescence[i].last_mandatory_flush);
 		}
 	}
 

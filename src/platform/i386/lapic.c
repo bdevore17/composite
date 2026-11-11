@@ -473,6 +473,33 @@ lapic_ipi_asnd_handler(struct pt_regs *regs)
 	return preempt;
 }
 
+/*
+ * Ask every other core to flush its TLB (see chal_tlbflush). This is
+ * asynchronous: each core records the time of its flush in
+ * tlb_quiescence[core].last_mandatory_flush, and reclaiming code polls
+ * tlb_quiescence_check() to know when all cores have flushed.
+ */
+void
+lapic_tlbflush_ipi_broadcast(void)
+{
+	int i;
+
+	for (i = 0; i < ncpus; i++) {
+		if (i == get_cpuid()) continue;
+		lapic_ipi_send(apicids[i], LAPIC_ICR_FIXED | HW_LAPIC_IPI_TLBFLUSH);
+	}
+}
+
+int
+lapic_ipi_tlbflush_handler(struct pt_regs *regs)
+{
+	tlb_mandatory_flush(NULL);
+	lapic_ack();
+
+	/* No scheduling decision: return to the interrupted thread. */
+	return 1;
+}
+
 int
 lapic_timer_handler(struct pt_regs *regs)
 {

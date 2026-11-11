@@ -65,10 +65,23 @@ chal_l1flush(void)
 	return 0;
 }
 
+/*
+ * TLB shootdown used by memory reclamation (CAPTBL_OP_HW_TLBFLUSH).
+ * Flush this core's TLB synchronously and ask all other cores to do
+ * the same with an IPI. This does *not* wait for the other cores:
+ * waiting with interrupts disabled could deadlock two cores that
+ * shoot down concurrently. Instead, each core records when it flushed
+ * (tlb_quiescence), and user-level polls CAPTBL_OP_HW_TLB_QUIESCENT
+ * before it reuses memory unmapped before that time.
+ */
 int
 chal_tlbflush(int a)
 {
-	/* TODO */
+	(void)a;
+
+	tlb_mandatory_flush(NULL);
+	lapic_tlbflush_ipi_broadcast();
+
 	return 0;
 }
 

@@ -78,6 +78,9 @@ void  lapic_timer_calibration(u32_t ratio);
 int   lapic_timer_calibrated(void);
 void  lapic_asnd_ipi_send(const cpuid_t cpu_id);
 void  lapic_selfipi(u8_t vector);
+void  lapic_tlbflush_ipi_broadcast(void);
+/* kernel/capinv.c: flush this core's TLB and record when (tlb_quiescence) */
+void  tlb_mandatory_flush(void *arg);
 
 void smp_init(volatile int *cores_ready);
 

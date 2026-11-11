@@ -1853,6 +1853,16 @@ static sword_t __attribute__((noinline)) composite_syscall_slowpath(struct pt_re
 			ret = chal_tlbstall();
 			break;
 		}
+		case CAPTBL_OP_HW_TLB_QUIESCENT: {
+			u64_t ts = __userregs_get1(regs);
+
+			/*
+			 * Memory unmapped before ts can be reused once
+			 * all cores flushed their TLB after ts.
+			 */
+			ret = tlb_quiescence_check(ts) ? 1 : 0;
+			break;
+		}
 		case CAPTBL_OP_HW_TLBSTALL_RECOUNT: {
 			ret = chal_tlbstall_recount(0);
 			break;
