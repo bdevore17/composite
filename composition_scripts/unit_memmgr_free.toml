@@ -1,0 +1,36 @@
+[system]
+description = "Memory reclamation: freeing heap pages, and releasing shared memory mapped by two components."
+
+[[components]]
+name = "booter"
+img  = "no_interface.llbooter"
+implements = [{interface = "init"}, {interface = "addr"}]
+deps = [{srv = "kernel", interface = "init", variant = "kernel"}]
+constructor = "kernel"
+
+[[components]]
+name = "capmgr"
+img  = "capmgr.simple"
+deps = [{srv = "booter", interface = "init"}, {srv = "booter", interface = "addr"}]
+implements = [{interface = "capmgr"}, {interface = "init"}, {interface = "memmgr"}, {interface = "capmgr_create"}]
+constructor = "booter"
+
+[[components]]
+name = "sched"
+img  = "sched.pfprr_quantum_static"
+deps = [{srv = "capmgr", interface = "init"}, {srv = "capmgr", interface = "capmgr"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "sched"}, {interface = "init"}]
+constructor = "booter"
+
+[[components]]
+name = "memmgr_peer"
+img  = "tests.unit_memmgr_peer"
+deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "memmgr_peer"}]
+constructor = "booter"
+
+[[components]]
+name = "unit_memmgr_free"
+img  = "tests.unit_memmgr_free"
+deps = [{srv = "memmgr_peer", interface = "memmgr_peer"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
+constructor = "booter"

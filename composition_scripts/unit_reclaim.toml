@@ -1,0 +1,9 @@
+[system]
+description = "Kernel-level tests of resource reclamation: thread, end-point, and capability release, and unmapping with TLB shootdown. Runs directly on the kernel."
+
+[[components]]
+name = "tests"
+img  = "tests.unit_reclaim"
+implements = [{interface = "init"}]
+deps = [{srv = "kernel", interface = "init", variant = "kernel"}]
+constructor = "kernel"
