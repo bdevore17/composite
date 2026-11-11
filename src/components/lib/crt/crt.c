@@ -1427,14 +1427,27 @@ crt_compinit_execute(comp_get_fn_t comp_get)
 		comp     = comp_get(id);
 		assert(comp);
 		initcore = comp->init_core == cos_cpuid();
-		assert(comp->init_state = CRT_COMP_INIT_COS_INIT);
 
 		if (initcore) {
+			/*
+			 * Only the initialization core moves the
+			 * component into initialization (the booter
+			 * might have already done so). The other cores
+			 * must not write the state: they can reach this
+			 * point arbitrarily late, after the component
+			 * has already progressed past `cos_init`.
+			 */
+			if (ps_load(&comp->init_state) == CRT_COMP_INIT_PREINIT) {
+				ps_store(&comp->init_state, CRT_COMP_INIT_COS_INIT);
+			}
+			assert(ps_load(&comp->init_state) == CRT_COMP_INIT_COS_INIT);
+
 			thdcap = crt_comp_thdcap_get(comp);
 			printc("Initializing component %lu (executing cos_init).\n", comp->id);
 		} else {
 			/* wait for the init core's thread to initialize */
-			while (ps_load(&comp->init_state) == CRT_COMP_INIT_COS_INIT) ;
+			while (ps_load(&comp->init_state) == CRT_COMP_INIT_PREINIT ||
+			       ps_load(&comp->init_state) == CRT_COMP_INIT_COS_INIT) ;
 			if (ps_load(&comp->init_state) != CRT_COMP_INIT_PAR_INIT) continue;
 
 			thdcap = crt_comp_thdcap_get(comp);
@@ -1528,7 +1541,19 @@ crt_compinit_done(struct crt_comp *c, int parallel_init, init_main_t main_type)
 	}
 	case CRT_COMP_INIT_PAR_INIT: {
 		simple_barrier(&c->barrier);
-		if (c->init_core != cos_cpuid()) break;
+		if (c->init_core != cos_cpuid()) {
+			/*
+			 * Only the initialization core moves the
+			 * component past parallel initialization. It
+			 * might not have done so yet (it can be delayed
+			 * anywhere after leaving the barrier), and our
+			 * `crt_compinit_execute` expects the transition
+			 * to be visible once we switch back, so wait
+			 * for it.
+			 */
+			while (ps_load(&c->init_state) == CRT_COMP_INIT_PAR_INIT) ;
+			break;
+		}
 
 		if (c->main_type == INIT_MAIN_NONE) ps_store(&c->init_state, CRT_COMP_INIT_PASSIVE);
 		else                                ps_store(&c->init_state, CRT_COMP_INIT_MAIN);
