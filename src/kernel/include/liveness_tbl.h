@@ -92,14 +92,58 @@ ERT_CREATE(__ltbl, ltbl, 1, 0, sizeof(int), LTBL_ENT_ORDER, sizeof(struct livene
 extern struct liveness_entry __liveness_tbl[LTBL_ENTS];
 #define LTBL_REF() ((struct ltbl *)__liveness_tbl)
 
+/*
+ * Layout of an entry's epoch, as used for components (see
+ * recovery.h):
+ *
+ * - bits 0-31: the liveness epoch proper, incremented when the object
+ *   is deactivated (ltbl_expire). Capabilities (sinv, asnd, comp, ...)
+ *   record this part when they are created (ltbl_get).
+ * - bits 32-62: the component's generation, incremented each time it
+ *   is reset by component recovery.
+ * - bit 63: the component is suspended (being recovered).
+ *
+ * A capability is alive if its epoch matches and the component is
+ * not suspended, whatever its generation (ltbl_isalive): resetting a
+ * component keeps the capabilities to it valid. Invocation stack
+ * frames instead record the *whole* epoch when they are pushed, and
+ * can only be returned to if it is unchanged (ltbl_frame_valid):
+ * frames of a component that was suspended or reset since cannot be
+ * resumed.
+ */
+#define LTBL_EPOCH_LIVE_MASK 0xFFFFFFFFULL
+#define LTBL_EPOCH_GEN_SHIFT 32
+#define LTBL_EPOCH_GEN_MASK (0x7FFFFFFFULL << LTBL_EPOCH_GEN_SHIFT)
+#define LTBL_EPOCH_SUSPENDED (1ULL << 63)
+
+static inline u64_t *
+ltbl_epoch_ptr(livenessid_t id)
+{
+	return __ltbl_lkupan(LTBL_REF(), id, __ltbl_maxdepth() + 1, NULL);
+}
+
+/* Is a capability that recorded epoch `ld_epoch` alive, given the entry's current epoch `e`? */
+static inline int
+ltbl_epoch_alive(u64_t e, u64_t ld_epoch)
+{
+	return (e & ~LTBL_EPOCH_GEN_MASK) == ld_epoch;
+}
+
 static inline int
 ltbl_isalive(struct liveness_data *ld)
 {
-	u64_t *epoch;
-
-	epoch = __ltbl_lkupan(LTBL_REF(), ld->id, __ltbl_maxdepth() + 1, NULL);
-	if (unlikely(*epoch != ld->epoch)) return 0;
+	if (unlikely(!ltbl_epoch_alive(*ltbl_epoch_ptr(ld->id), ld->epoch))) return 0;
 	return 1;
+}
+
+/*
+ * Is an invocation stack frame (that recorded the whole epoch when
+ * it was pushed) still valid?
+ */
+static inline int
+ltbl_frame_valid(struct liveness_data *ld)
+{
+	return *ltbl_epoch_ptr(ld->id) == ld->epoch;
 }
 
 /* Increment epoch, and update timestamp. */
@@ -149,7 +193,8 @@ ltbl_get(livenessid_t id, struct liveness_data *ld)
 	e = (u64_t *)__ltbl_lkupan(LTBL_REF(), id, __ltbl_maxdepth() + 1, NULL);
 	assert(e);
 
-	ld->epoch = *e;
+	/* Capabilities only record the liveness part (see LTBL_EPOCH_*) */
+	ld->epoch = *e & LTBL_EPOCH_LIVE_MASK;
 	ld->id    = id;
 
 	return 0;

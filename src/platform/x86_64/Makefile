@@ -72,6 +72,7 @@ COS_CFILES += ../../kernel/liveness_tbl.c
 COS_CFILES += ../../kernel/tcap.c
 COS_CFILES += ../../kernel/capinv.c
 COS_CFILES += ../../kernel/captbl.c
+COS_CFILES += ../../kernel/recovery.c
 
 OBJS += $(COS_CFILES:../../kernel/%.c=%.o)
 DEPS += $(COS_CFILES:../../kernel/%.c=%.d)

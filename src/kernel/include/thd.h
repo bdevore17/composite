@@ -19,12 +19,31 @@
 #include "tcap.h"
 #include "list.h"
 #include <vm_vcpu_context.h>
+/*
+ * A frame of the invocation stack: the component executing in it,
+ * and, once it invoked another component, where to return to (sp,
+ * ip, protdom). comp_info.liveness.epoch records the component's
+ * whole epoch when the frame was pushed (see LTBL_EPOCH_*): the frame
+ * can't be returned to once the component was suspended or reset by
+ * component recovery. saved_regs are the registers to restore if the
+ * invocation this frame made is unwound (recovery.h).
+ */
 struct invstk_entry {
 	struct comp_info comp_info;
 	unsigned long    sp, ip;
 	unsigned long    ulk_stkoff;
 	prot_domain_t    protdom;
+	u32_t            flags;
+	unsigned long    saved_regs[INVSTK_SAVED_REGS];
 } HALF_CACHE_ALIGNED;
+
+typedef enum {
+	/*
+	 * The thread faulted in this frame's component, and was
+	 * redirected to the fault handler in the next frame.
+	 */
+	INVSTK_FAULTED = 1,
+} invstk_flags_t;
 
 
 #define THD_INVSTK_MAXSZ 16
@@ -101,6 +120,8 @@ struct thread {
 	struct rcvcap_info rcvcap;
 	struct list        event_head; /* all events for *this* end-point */
 	struct list_node   event_list; /* the list of events for another end-point */
+
+	struct list_node   thd_list;   /* all threads of this core (thd_core_list_add), see recovery.h */
 
 	u8_t thd_type; /* vm thread or host thread */
 	struct vm_vcpu_context vcpu_ctx;
@@ -366,6 +387,36 @@ thd_vm_exec(struct thread *thd)
 	vm_thd_exec(thd);
 }
 
+/*
+ * All threads of each core, so that component recovery can find the
+ * threads executing in a component. Only accessed from the threads'
+ * core (thread activation and deactivation happen there).
+ */
+extern struct list thd_core_list[NUM_CPU];
+
+static inline struct list *
+thd_list_core(void)
+{
+	struct list *l = &thd_core_list[get_cpuid()];
+
+	if (unlikely(!l->l.next)) list_head_init(l);
+
+	return l;
+}
+
+static inline void
+thd_core_list_add(struct thread *thd)
+{
+	list_init(&thd->thd_list, thd);
+	list_enqueue(thd_list_core(), &thd->thd_list);
+}
+
+static inline void
+thd_core_list_rem(struct thread *thd)
+{
+	list_rem(&thd->thd_list);
+}
+
 static int
 thd_activate(struct captbl *t, capid_t cap, capid_t capin, struct thread *thd, capid_t compcap, thdclosure_index_t init_data, thdid_t tid, struct ulk_invstk *ulinvstk)
 {
@@ -406,6 +457,9 @@ thd_activate(struct captbl *t, capid_t cap, capid_t capin, struct thread *thd, c
 	list_init(&thd->event_list, thd);
 
 	thd_type_init(thd, type);
+	/* The base frame is valid for the component's current generation (see LTBL_EPOCH_*) */
+	thd->invstk[0].comp_info.liveness.epoch = *ltbl_epoch_ptr(compc->info.liveness.id);
+	thd_core_list_add(thd);
 	if (likely(type == THD_TYPE_HOST)) {
 		thd_upcall_setup(thd, compc->entry_addr, COS_UPCALL_THD_CREATE, init_data, 0, 0);
 	} else {
@@ -476,6 +530,7 @@ thd_deactivate(struct captbl *ct, struct cap_captbl *dest_ct, unsigned long capi
 		if (cli->next_ti.thd == thd) thd_next_thdinfo_update(cli, 0, 0, 0, 0);
 		/* Remove pending (unconsumed) scheduling events of this thread. */
 		if (!list_empty(&thd->event_list)) list_rem(&thd->event_list);
+		thd_core_list_rem(thd);
 
 		/* move the kmem for the thread to a location
 		 * in a pagetable as COSFRAME */
@@ -526,13 +581,17 @@ thd_current_pgtbl(struct thread *thd)
 	return curr_entry->comp_info.pgtblinfo.pgtbl;
 }
 
+/*
+ * Push a frame for component ci (whose current epoch is `epoch`) on
+ * the current thread, that invoked it with regs.
+ */
 static inline int
-thd_invstk_push(struct thread *thd, struct comp_info *ci, unsigned long ip, unsigned long sp,
-                struct cos_cpu_local_info *cos_info)
+thd_invstk_push(struct thread *thd, struct comp_info *ci, u64_t epoch, unsigned long ip, unsigned long sp,
+                struct pt_regs *regs, struct cos_cpu_local_info *cos_info)
 {
 	struct invstk_entry *top, *prev;
 
-	if (unlikely(curr_invstk_top(cos_info) >= THD_INVSTK_MAXSZ)) return -1;
+	if (unlikely(curr_invstk_top(cos_info) >= THD_INVSTK_MAXSZ - 1)) return -1;
 
 	prev = &thd->invstk[curr_invstk_top(cos_info)];
 	top  = &thd->invstk[curr_invstk_top(cos_info) + 1];
@@ -540,8 +599,11 @@ thd_invstk_push(struct thread *thd, struct comp_info *ci, unsigned long ip, unsi
 	prev->ip      = ip;
 	prev->sp      = sp;
 	prev->protdom = chal_protdom_read();
+	__userregs_inv_save(regs, prev->saved_regs);
 	memcpy(&top->comp_info, ci, sizeof(struct comp_info));
+	top->comp_info.liveness.epoch = epoch;
 	top->ip = top->sp = 0;
+	top->flags = 0;
 	
 	if (likely(thd->ulk_invstk)) top->ulk_stkoff = thd->ulk_invstk->top;
 

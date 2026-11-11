@@ -181,6 +181,32 @@ typedef enum {
 	 */
 	CAPTBL_OP_HW_TLB_QUIESCENT,
 
+	/*
+	 * Component recovery (see recovery.h in the kernel). All of
+	 * these operate on a component capability, held by the
+	 * component's manager.
+	 *
+	 * - REGISTER(sinvcap): faults of the component are recoverable,
+	 *   and are redirected to the synchronous invocation `sinvcap`
+	 *   (in the caller's capability table) of the manager.
+	 * - UPCALL(type, a1, a2, a3): invoke the component's upcall
+	 *   entry (as for thread creation) synchronously on the current
+	 *   thread, with cos_upcall_fn(type, a1, a2, a3). This works
+	 *   while the component is suspended.
+	 * - QUIESCE(): ask all cores to stop executing in suspended
+	 *   components. Returns a request number for QUIESCENT.
+	 * - QUIESCENT(req): -EAGAIN until all cores processed request
+	 *   `req`, then the number of threads that still execute in
+	 *   other components on behalf of this (suspended) component.
+	 * - RESUME(retval): the component's recovery is complete: make
+	 *   it available again (with a new generation), and return from
+	 *   the current invocation (the fault handler) with retval.
+	 */
+	CAPTBL_OP_COMP_RECOVERY_REGISTER,
+	CAPTBL_OP_COMP_UPCALL,
+	CAPTBL_OP_COMP_RECOVERY_QUIESCE,
+	CAPTBL_OP_COMP_RECOVERY_QUIESCENT,
+	CAPTBL_OP_COMP_RECOVERY_RESUME,
 } syscall_op_t;
 
 typedef enum {
@@ -531,8 +557,22 @@ typedef enum {
 	COS_UPCALL_ACAP_COMPLETE,
 	COS_UPCALL_DESTROY,
 	COS_UPCALL_UNHANDLED_FAULT,
-	COS_UPCALL_QUARANTINE
+	COS_UPCALL_QUARANTINE,
+	/*
+	 * Component recovery: what initialization would have to be
+	 * re-run (returns cos_recovery_flags_t), and re-running the
+	 * initialization after the component's memory was reset.
+	 */
+	COS_UPCALL_RECOVER_QUERY,
+	COS_UPCALL_RECOVER_INIT,
 } upcall_type_t;
+
+/* Returned by the COS_UPCALL_RECOVER_QUERY upcall */
+typedef enum {
+	COS_RECOVERY_CAPABLE       = 1,      /* the component supports the recovery upcalls */
+	COS_RECOVERY_MAIN          = 1 << 1, /* defines main or parallel_main */
+	COS_RECOVERY_PARALLEL_INIT = 1 << 2, /* defines cos_parallel_init */
+} cos_recovery_flags_t;
 
 typedef enum {
 	COMP_FLAG_SCHED  = 1,      /* component is a scheduler */
@@ -557,6 +597,10 @@ typedef enum {
 	COS_FLT_OVERFLOW,
 	COS_FLT_RANGE,
 	COS_FLT_GEN_PROT,
+	COS_FLT_INV_OPCODE,
+	COS_FLT_SEGMENT, /* segment not present, or stack segment */
+	COS_FLT_ALIGN,
+	COS_FLT_FPU, /* x87 or SIMD floating-point exception */
 	/* software defined: */
 	COS_FLT_LINUX,
 	COS_FLT_SAVE_REGS,

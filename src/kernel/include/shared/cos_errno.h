@@ -28,3 +28,10 @@
 
 #define EQUIESCENCE (ERRNOBASE + 0)
 #define ECASFAIL (ERRNOBASE + 1)
+/*
+ * The invocation did not complete because the server component
+ * faulted, and is being (or was) reset by its manager (see component
+ * recovery in the kernel's recovery.h). The server's state was lost;
+ * the invocation can be retried.
+ */
+#define ECOMPRESET (ERRNOBASE + 2)

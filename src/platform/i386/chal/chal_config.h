@@ -46,6 +46,7 @@ typedef enum {
 	HW_ID30,
 	HW_ID31,
 	HW_LAPIC_SPURIOUS,
+	HW_LAPIC_IPI_RECOVERY = 251, /* ipi requesting to stop executing in suspended components (recovery.h) */
 	HW_LAPIC_IPI_TLBFLUSH = 252, /* ipi requesting a TLB flush (memory reclamation) */
 	HW_LAPIC_IPI_ASND    = 253, /* ipi interrupt for asnd */
 	HW_LAPIC_TIMER       = 254, /* Local APIC TSC-DEADLINE mode - Timer interrupts */

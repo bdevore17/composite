@@ -193,6 +193,7 @@ IRQ_ID(62)
 IRQ(lapic_spurious)
 IRQ(lapic_ipi_asnd)
 IRQ(lapic_ipi_tlbflush)
+IRQ(lapic_ipi_recovery)
 IRQ(lapic_timer)
 IRQ(posted_intr)
 

@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "chal_cpu.h"
 #include "isr.h"
+#include <recovery.h>
 
 #define APIC_DEFAULT_PHYS 0xfee00000
 #define APIC_HDR_LEN_OFF 0x04
@@ -498,6 +499,33 @@ lapic_ipi_tlbflush_handler(struct pt_regs *regs)
 
 	/* No scheduling decision: return to the interrupted thread. */
 	return 1;
+}
+
+/*
+ * Component recovery (recovery.h): ask every other core to stop
+ * executing in suspended components. Asynchronous, as the TLB
+ * shootdown: each core acknowledges the request in
+ * comp_recovery_ipi, and the recovery manager polls for it.
+ */
+void
+chal_recovery_ipi_broadcast(void)
+{
+	int i;
+
+	for (i = 0; i < ncpus; i++) {
+		if (i == get_cpuid()) continue;
+		lapic_ipi_send(apicids[i], LAPIC_ICR_FIXED | HW_LAPIC_IPI_RECOVERY);
+	}
+}
+
+int
+lapic_ipi_recovery_handler(struct pt_regs *regs)
+{
+	int ret = comp_recovery_ipi(regs);
+
+	lapic_ack();
+
+	return ret;
 }
 
 int

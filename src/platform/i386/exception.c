@@ -5,10 +5,20 @@
 #include "string.h"
 #include "isr.h"
 #include "chal_cpu.h"
+#include <recovery.h>
+
+/*
+ * Faults in user-level are first offered to component recovery
+ * (recovery.h), which returns to user-level if the fault is
+ * recoverable. Otherwise, the system stops.
+ */
+#define RECOVER(regs, type, addr) \
+	do { if (comp_recovery_fault(regs, type, addr)) return 1; } while (0)
 
 int
 div_by_zero_err_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_DIVZERO, 0);
 	print_pt_regs(regs);
 	die("FAULT: Divide by Zero Error\n\n");
 
@@ -27,6 +37,7 @@ debug_trap_handler(struct pt_regs *regs)
 int
 breakpoint_trap_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_BRKPT, 0);
 	print_pt_regs(regs);
 	die("TRAP: Breakpoint\n");
 
@@ -36,6 +47,7 @@ breakpoint_trap_handler(struct pt_regs *regs)
 int
 overflow_trap_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_OVERFLOW, 0);
 	print_pt_regs(regs);
 	die("TRAP: Overflow\n");
 
@@ -45,6 +57,7 @@ overflow_trap_handler(struct pt_regs *regs)
 int
 bound_range_exceed_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_RANGE, 0);
 	print_pt_regs(regs);
 	die("FAULT: Bound Range Exceeded\n");
 
@@ -54,6 +67,7 @@ bound_range_exceed_fault_handler(struct pt_regs *regs)
 int
 invalid_opcode_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_INV_OPCODE, 0);
 	print_pt_regs(regs);
 	die("FAULT: Invalid opcode\n");
 
@@ -94,6 +108,7 @@ invalid_tss_fault_handler(struct pt_regs *regs)
 int
 seg_not_present_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_SEGMENT, 0);
 	print_pt_regs(regs);
 	die("FAULT: Segment Not Present\n");
 
@@ -103,6 +118,7 @@ seg_not_present_fault_handler(struct pt_regs *regs)
 int
 stack_seg_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_SEGMENT, 0);
 	print_pt_regs(regs);
 	die("FAULT: Stack Segment Fault\n");
 
@@ -112,6 +128,7 @@ stack_seg_fault_handler(struct pt_regs *regs)
 int
 gen_protect_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_GEN_PROT, 0);
 	print_pt_regs(regs);
 	die("FAULT: General Protection Fault\n");
 	return 1;
@@ -125,10 +142,11 @@ page_fault_handler(struct pt_regs *regs)
 	struct thread * curr             = thd_current(ci);
 	thdid_t                    thdid = curr->tid;
 
-	print_pt_regs(regs);
 	fault_addr = chal_cpu_fault_vaddr(regs);
 	errcode    = chal_cpu_fault_errcode(regs);
 	ip        = chal_cpu_fault_ip(regs);
+	RECOVER(regs, COS_FLT_PGFLT, fault_addr);
+	print_pt_regs(regs);
 
 	die("FAULT: Page Fault in thd %d (%s %s %s %s %s) @ 0x%p, ip 0x%p, tls 0x%p\n", thdid,
 	    errcode & PGTBL_PRESENT ? "present" : "not-present",
@@ -141,6 +159,7 @@ page_fault_handler(struct pt_regs *regs)
 int
 x87_float_pt_except_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_FPU, 0);
 	print_pt_regs(regs);
 	die("FAULT: x87 Floating-point Exception\n");
 
@@ -150,6 +169,7 @@ x87_float_pt_except_fault_handler(struct pt_regs *regs)
 int
 align_check_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_ALIGN, 0);
 	print_pt_regs(regs);
 	die("FAULT: Alignment Check\n");
 
@@ -168,6 +188,7 @@ machine_check_abort_handler(struct pt_regs *regs)
 int
 simd_float_pt_except_fault_handler(struct pt_regs *regs)
 {
+	RECOVER(regs, COS_FLT_FPU, 0);
 	print_pt_regs(regs);
 	die("FAULT: SMID Floating-point Exception\n");
 

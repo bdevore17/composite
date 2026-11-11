@@ -18,6 +18,7 @@
 #include "include/chal/chal_proto.h"
 #include "include/ulk.h"
 #include "include/vm.h"
+#include "include/recovery.h"
 
 
 #define COS_DEFAULT_RET_CAP 0
@@ -394,14 +395,30 @@ cap_thd_switch(struct pt_regs *regs, struct thread *curr, struct thread *next, s
 	int                  preempt = 0;
 	prot_domain_t        next_protdom;
 
-	next_ci = thd_invstk_curr_comp(next, &next_pt, cos_info);
-
-	assert(next_ci && curr && next && next_pt);
+	assert(curr && next);
 	assert(curr->cpuid == get_cpuid() && next->cpuid == get_cpuid());
 	if (unlikely(curr == next)) return thd_switch_update(curr, regs, 1);
 
-	/* FIXME: trigger fault for the next thread, for now, return error */
-	if (unlikely(!ltbl_isalive(&next_ci->liveness))) {
+	/*
+	 * If the component the thread executes in was suspended or
+	 * reset by component recovery, the thread returns an error to
+	 * its caller instead (see recovery.h).
+	 */
+	if (unlikely(comp_recovery_thd_resume(next))) {
+		assert(!(curr->state & THD_STATE_PREEMPTED));
+		assert(curr->thd_type != THD_TYPE_VM);
+		__userregs_set(regs, -EFAULT, __userregs_getsp(regs), __userregs_getip(regs));
+		return 0;
+	}
+	next_ci = thd_invstk_curr_comp(next, &next_pt, cos_info);
+	assert(next_ci && next_pt);
+
+	/*
+	 * FIXME: trigger fault for the next thread, for now, return
+	 * error. The kernel's frame was checked above, only the
+	 * components of user-level invocations remain to be checked.
+	 */
+	if (unlikely(next_ci != &next->invstk[next->invstk_top].comp_info && !ltbl_isalive(&next_ci->liveness))) {
 		assert(!(curr->state & THD_STATE_PREEMPTED));
 		assert(curr->thd_type != THD_TYPE_VM);
 		__userregs_set(regs, -EFAULT, __userregs_getsp(regs), __userregs_getip(regs));
@@ -1647,6 +1664,10 @@ static sword_t __attribute__((noinline)) composite_syscall_slowpath(struct pt_re
 		default:
 			goto err;
 		}
+		break;
+	}
+	case CAP_COMP: {
+		ret = comp_recovery_op(ct, (struct cap_comp *)ch, op, thd, regs, cos_info, thd_switch);
 		break;
 	}
 	case CAP_SRET: {

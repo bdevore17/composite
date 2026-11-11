@@ -139,6 +139,8 @@ asnd_deactivate(struct cap_captbl *t, capid_t capin, livenessid_t lid)
 }
 
 int cap_ipi_process(struct pt_regs *regs);
+/* recovery.c */
+int comp_recovery_sret_unwind(struct thread *thd, struct pt_regs *regs, struct cos_cpu_local_info *cos_info);
 
 /* send to a receive end-point within an interrupt */
 int cap_hw_asnd(struct cap_asnd *asnd, struct pt_regs *regs);
@@ -302,6 +304,7 @@ static inline void
 sinv_call(struct thread *thd, struct cap_sinv *sinvc, struct pt_regs *regs, struct cos_cpu_local_info *cos_info)
 {
 	unsigned long ip, sp;
+	u64_t         epoch;
 
 	ip = __userregs_getip(regs);
 	sp = __userregs_getsp(regs);
@@ -312,14 +315,20 @@ sinv_call(struct thread *thd, struct cap_sinv *sinvc, struct pt_regs *regs, stru
 	 * this path (to avoid serialization in the store buffer), and
 	 * optimize the static branch prediction.
 	 */
-	if (unlikely(!ltbl_isalive(&(sinvc->comp_info.liveness)))) {
+	epoch = *ltbl_epoch_ptr(sinvc->comp_info.liveness.id);
+	if (unlikely(!ltbl_epoch_alive(epoch, sinvc->comp_info.liveness.epoch))) {
+		/* Is the server being recovered (see recovery.h)? Then fail fast. */
+		if (ltbl_epoch_alive(epoch & ~LTBL_EPOCH_SUSPENDED, sinvc->comp_info.liveness.epoch)) {
+			__userregs_set(regs, -ECOMPRESET, __userregs_getsp(regs), __userregs_getip(regs));
+			return;
+		}
 		printk("cos: sinv comp (liveness %d) doesn't exist!\n", sinvc->comp_info.liveness.id);
 		// FIXME: add fault handling here.
 		__userregs_set(regs, -EFAULT, __userregs_getsp(regs), __userregs_getip(regs));
 		return;
 	}
 
-	if (unlikely(thd_invstk_push(thd, &sinvc->comp_info, ip, sp, cos_info))) {
+	if (unlikely(thd_invstk_push(thd, &sinvc->comp_info, epoch, ip, sp, regs, cos_info))) {
 		__userregs_set(regs, -1, sp, ip);
 		return;
 	}
@@ -348,9 +357,16 @@ sret_ret(struct thread *thd, struct pt_regs *regs, struct cos_cpu_local_info *co
 		return;
 	}
 
-	if (unlikely(!ltbl_isalive(&ci->liveness))) {
+	if (unlikely(!ltbl_frame_valid(&ci->liveness))) {
+		/*
+		 * The component we return to was suspended or reset
+		 * by component recovery since it made the invocation:
+		 * return an error to the first valid caller instead.
+		 */
+		if (comp_recovery_sret_unwind(thd, regs, cos_info) == 0) return;
+		/* No frame to return to: keep the thread where it is */
+		curr_invstk_inc(cos_info);
 		printk("cos: ret comp (liveness %d) doesn't exist!\n", ci->liveness.id);
-		// FIXME: add fault handling here.
 		__userregs_set(regs, -EFAULT, __userregs_getsp(regs), __userregs_getip(regs));
 		return;
 	}
