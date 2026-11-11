@@ -83,8 +83,7 @@ slm_thd_mem_alloc(thdcap_t _cap, thdid_t _tid, thdcap_t *thd, thdid_t *tid)
 }
 
 void slm_thd_mem_activate(struct slm_thd_container *t) { ss_thd_activate(t); }
-/* TODO */
-void slm_thd_mem_free(struct slm_thd_container *t) { return; }
+void slm_thd_mem_free(struct slm_thd_container *t) { ss_thd_free(t); }
 
 thdid_t
 sched_thd_create_closure(thdclosure_index_t idx)
@@ -93,6 +92,8 @@ sched_thd_create_closure(thdclosure_index_t idx)
 	struct slm_thd *t = thd_alloc_in(cos_inv_token(), idx, &p, 0);
 
 	if (!t) return 0;
+	/* Remember the component the thread executes in, for sched_thd_delete */
+	ss_thd_get(t->tid)->resources.comp = (compid_t)cos_inv_token();
 
 	return t->tid;
 }
@@ -111,10 +112,43 @@ sched_thd_param_set(thdid_t tid, sched_param_t p)
 	return slm_sched_thd_update(t, type, value);
 }
 
+/*
+ * Delete a thread created (by sched_thd_create*) in the calling
+ * component, and release all of its resources. The thread is removed
+ * from scheduling (if it didn't already sched_thd_exit), and the
+ * capability manager deallocates it, so its thread id can be reused.
+ * Must be called on the core of the thread, and not by the thread
+ * itself (use sched_thd_exit). The thread must not be blocked on a
+ * scheduler block point (e.g. a lock), which would keep a reference.
+ *
+ * Returns 0 on success, -EINVAL for an unknown thread or wrong core,
+ * -EPERM if it isn't one of the caller's threads, -EBUSY if the
+ * thread is the caller.
+ */
 int
 sched_thd_delete(thdid_t tid)
 {
-	return 0;
+	struct slm_thd *current = slm_thd_current();
+	struct slm_thd_container *tc = ss_thd_get(tid);
+	struct slm_thd *t;
+	int ret;
+
+	if (!tc) return -EINVAL;
+	t = &tc->thd;
+	if (tc->resources.comp != (compid_t)cos_inv_token()) return -EPERM;
+	if (t->cpuid != cos_cpuid()) return -EINVAL;
+	if (t == current) return -EBUSY;
+
+	slm_cs_enter(current, SLM_CS_NONE);
+	if (t->state != SLM_THD_DYING) slm_thd_deinit(t);
+	slm_cs_exit(NULL, SLM_CS_NONE);
+
+	/* Free our bookkeeping before the capmgr makes tid reusable */
+	slm_thd_mem_free(tc);
+	ret = capmgr_thd_release(tid);
+	if (ret) printc("sched: capmgr could not release thread %lu (err %d)\n", (unsigned long)tid, ret);
+
+	return ret;
 }
 
 int
