@@ -111,6 +111,24 @@ retypetbl_ref(void *pa, u32_t order)
 	return 0;
 }
 
+/*
+ * Add `val` to the reference count of a per-core entry. The per-core
+ * counts of a page can be negative (a page mapped on one core and
+ * unmapped on another), so update the count field only: decrementing
+ * the whole word would borrow from the type when the count is 0.
+ */
+static inline void
+retypetbl_refcnt_add(struct retype_entry *e, int val)
+{
+	union refcnt_atom local_u;
+	u32_t             old_v;
+
+	do {
+		old_v = local_u.v = e->refcnt_atom.v;
+		local_u.ref_cnt   = local_u.ref_cnt + val;
+	} while (retypetbl_cas(&(e->refcnt_atom.v), old_v, local_u.v) != CAS_SUCCESS);
+}
+
 int
 retypetbl_deref(void *pa, u32_t order)
 {
@@ -132,7 +150,7 @@ retypetbl_deref(void *pa, u32_t order)
 		walk[i].p = GET_RETYPE_ENTRY(idx, ORDER(i));
 		if (walk[i].p->refcnt_atom.type == RETYPETBL_KERN) cos_throw(err, -EPERM);
 		if (walk[i].p->refcnt_atom.type == RETYPETBL_USER) found = 1;
-		walk[i].p->refcnt_atom.v--;
+		retypetbl_refcnt_add(walk[i].p, -1);
 		walk[i].inc_cnt = 1;
 	}
 	if (!found) cos_throw(err, -EPERM);
@@ -142,9 +160,10 @@ retypetbl_deref(void *pa, u32_t order)
 	
 	return 0;
 err:
-	/* Prepare to unwind and quit */
+	/* Prepare to unwind and quit (all levels were walked if the frame wasn't found) */
+	if (i < 0) i = 0;
 	for ( ; i <= POS(MAX_PAGE_ORDER); i++) {
-		if (walk[i].inc_cnt != 0) walk[i].p->refcnt_atom.v++;
+		if (walk[i].inc_cnt != 0) retypetbl_refcnt_add(walk[i].p, 1);
 	}
 	return ret;
 }
