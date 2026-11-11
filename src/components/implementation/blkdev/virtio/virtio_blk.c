@@ -394,3 +394,13 @@ cos_init(void)
 {
 	vblk_init();
 }
+
+/*
+ * A passive server has no main. Defining a (trivial) parallel init
+ * tells the init protocol that, so the initialization threads exit
+ * after it instead of looking for a main to run.
+ */
+void
+cos_parallel_init(coreid_t cid, int init_core, int ncores)
+{
+}

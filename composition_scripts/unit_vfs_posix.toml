@@ -25,7 +25,7 @@ constructor = "booter"
 [[components]]
 name = "vfs"
 img  = "vfs.ramfs"
-deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
 implements = [{interface = "vfs"}]
 constructor = "booter"
 

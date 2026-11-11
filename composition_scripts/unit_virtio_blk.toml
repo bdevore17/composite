@@ -25,12 +25,12 @@ constructor = "booter"
 [[components]]
 name = "blkdev"
 img  = "blkdev.virtio"
-deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}, {srv = "capmgr", interface = "contigmem"}]
+deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}, {srv = "capmgr", interface = "contigmem"}]
 implements = [{interface = "blkdev"}]
 constructor = "booter"
 
 [[components]]
 name = "blktest"
 img  = "tests.unit_virtio_blk"
-deps = [{srv = "blkdev", interface = "blkdev"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+deps = [{srv = "blkdev", interface = "blkdev"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
 constructor = "booter"

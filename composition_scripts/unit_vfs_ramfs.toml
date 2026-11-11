@@ -25,18 +25,18 @@ constructor = "booter"
 [[components]]
 name = "vfs"
 img  = "vfs.ramfs"
-deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
 implements = [{interface = "vfs"}]
 constructor = "booter"
 
 [[components]]
 name = "vfstest1"
 img  = "tests.unit_vfs_ramfs"
-deps = [{srv = "vfs", interface = "vfs"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+deps = [{srv = "vfs", interface = "vfs"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
 constructor = "booter"
 
 [[components]]
 name = "vfstest2"
 img  = "tests.unit_vfs_ramfs"
-deps = [{srv = "vfs", interface = "vfs"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+deps = [{srv = "vfs", interface = "vfs"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
 constructor = "booter"
