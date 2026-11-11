@@ -124,10 +124,12 @@ enter(int need_shm, long *err)
 	return c;
 }
 
-#define EXIT(ret)                     \
-	do {                          \
-		vfs_server_unlock();  \
-		return (ret);         \
+/* Evaluate expr (the operation) with the lock held, then release it and return the result. */
+#define EXIT(expr)                         \
+	do {                               \
+		long __exit_ret = (expr);  \
+		vfs_server_unlock();       \
+		return __exit_ret;         \
 	} while (0)
 
 /* Copy the NUL-terminated path at shm+off into vfs_path[idx]. */
