@@ -62,11 +62,41 @@ typedef capid_t vm_lapiccap_t;
 typedef capid_t vm_shared_mem_t;
 typedef capid_t vm_vmcb_t;
 
+/*
+ * Deferred reuse of released resources (see "Resource reclamation"
+ * below). A FIFO of released capability ids or kernel memory pages,
+ * each tagged with the time it was released. An entry is only handed
+ * out again after the kernel quiescence period has passed since its
+ * release, so that no core can still be in the kernel using the old
+ * object.
+ */
+#define COS_RECLAIM_RING_SZ 512 /* power of 2 */
+
+struct cos_reclaim_ent {
+	word_t id;
+	u64_t  ts;
+};
+
+struct cos_reclaim_ring {
+	struct ps_lock         lock;
+	unsigned long          head, tail; /* pop at head, push at tail */
+	unsigned long          dropped;    /* releases that didn't fit, thus are never reused */
+	struct cos_reclaim_ent ents[COS_RECLAIM_RING_SZ];
+};
+
+/* One ring per capability-slot size (16, 32 and 64 byte slots) */
+#define COS_RECLAIM_CAPSZ_NUM 3
+struct cos_capid_reclaim {
+	struct cos_reclaim_ring sz[COS_RECLAIM_CAPSZ_NUM];
+};
+
 /* Memory source information */
 struct cos_meminfo {
 	vaddr_t    untyped_ptr, umem_ptr, kmem_ptr;
 	vaddr_t    untyped_frontier, umem_frontier, kmem_frontier;
 	pgtblcap_t pgtbl_cap;
+	/* released kernel memory pages to reuse before bump-allocating new ones (or NULL) */
+	struct cos_reclaim_ring *kmem_reclaim;
 
 	capid_t	   second_lvl_pgtbl_cap;
 	vaddr_t	   second_lvl_pgtbl_addr;
@@ -94,6 +124,9 @@ struct cos_compinfo {
 	capid_t pgtbl_cap_shared;
 
 	u8_t comp_type;
+
+	/* released capability ids to reuse before bump-allocating new ones (or NULL) */
+	struct cos_capid_reclaim *capid_reclaim;
 };
 
 #define COMP_TYPE_DEF (0)
@@ -210,6 +243,13 @@ int     cos_mem_alias_at(struct cos_compinfo *dstci, vaddr_t dst, struct cos_com
 int     cos_mem_alias_atn(struct cos_compinfo *dstci, vaddr_t dst, struct cos_compinfo *srcci, vaddr_t src, size_t sz, unsigned long perm_flags);
 vaddr_t cos_mem_move(struct cos_compinfo *dstci, struct cos_compinfo *srcci, vaddr_t src);
 int     cos_mem_move_at(struct cos_compinfo *dstci, vaddr_t dst, struct cos_compinfo *srcci, vaddr_t src);
+/*
+ * Unmap the page at addr from pgtbl pt. The frame stays referenced by
+ * its other mappings. The TLBs of all cores might still cache the
+ * translation: don't reuse the frame for anyone else before
+ * cos_hw_tlb_quiescent says that all cores have flushed since the
+ * unmap (see cos_hw_tlbflush).
+ */
 int     cos_mem_remove(pgtblcap_t pt, vaddr_t addr);
 
 /* Tcap operations */
@@ -237,13 +277,69 @@ int     cos_hw_cycles_per_usec(hwcap_t hwc);
 int     cos_hw_cycles_thresh(hwcap_t hwc);
 int     cos_hw_tlb_lockdown(hwcap_t hwc, unsigned long entryid, unsigned long vaddr, unsigned long paddr);
 int     cos_hw_l1flush(hwcap_t hwc);
+/*
+ * Start a TLB shootdown: flush this core's TLB and send an IPI asking
+ * all other cores to flush theirs. Doesn't wait for the other cores.
+ */
 int     cos_hw_tlbflush(hwcap_t hwc);
+/*
+ * Have all cores flushed their TLBs since timestamp ts (a value of
+ * ps_tsc() taken after an unmap)? 1 if yes, 0 if no, < 0 on error.
+ */
+int     cos_hw_tlb_quiescent(hwcap_t hwc, u64_t ts);
 int     cos_hw_tlbstall(hwcap_t hwc);
 int     cos_hw_tlbstall_recount(hwcap_t hwc);
 void    cos_hw_shutdown(hwcap_t hwc);
 
 
 capid_t cos_capid_bump_alloc(struct cos_compinfo *ci, cap_t cap);
+
+/**************** [Resource reclamation] ****************
+ *
+ * The allocation functions above bump-allocate capability ids,
+ * kernel memory, and thread ids, and never reuse them. A manager
+ * (e.g. the capmgr) that wants to release resources:
+ *
+ * 1. registers reclamation rings with cos_capid_reclaim_init (per
+ *    compinfo whose capability table it manages) and
+ *    cos_kmem_reclaim_init (on the compinfo with the memory),
+ * 2. deactivates capabilities with cos_cap_deactivate (copies) and
+ *    cos_thd_dealloc (the last reference to a thread, releasing its
+ *    kernel memory).
+ *
+ * Released capability ids and kernel pages are reused by the normal
+ * allocation functions once the kernel quiescence period
+ * (KERN_QUIESCENCE_CYCLES) has passed since their release. Capability
+ * slots are deactivated with liveness id 0, so the kernel itself
+ * doesn't delay their reuse: that is enforced by the rings instead.
+ * Thread ids are recycled through cos_thd_id_free.
+ */
+void cos_capid_reclaim_init(struct cos_compinfo *ci, struct cos_capid_reclaim *r);
+void cos_kmem_reclaim_init(struct cos_compinfo *ci, struct cos_reclaim_ring *r);
+/* Return a capability id (whose slot is already deactivated) / kernel page for reuse. 0 on success. */
+int  cos_capid_free(struct cos_compinfo *ci, capid_t cap, cap_t type);
+int  cos_kmem_free(struct cos_compinfo *ci, vaddr_t kmem);
+/*
+ * Deactivate capability cap of type in ci's capability table, and
+ * return its id for reuse. Not for the last reference to a thread
+ * (use cos_thd_dealloc). Supports CAP_THD, CAP_ARCV, CAP_ASND, and
+ * CAP_SINV. Returns 0 on success, the kernel's error otherwise.
+ */
+int  cos_cap_deactivate(struct cos_compinfo *ci, capid_t cap, cap_t type);
+/*
+ * Deactivate the last capability to a thread (in ci's capability
+ * table, ci being the compinfo that has the memory), release the
+ * thread's kernel memory kmem (as returned by cos_thd_alloc_ext_kmem
+ * or cos_initthd_alloc_kmem), and its thread id tid. All copies of
+ * the capability must have been deactivated first, and the thread
+ * must not be bound to an arcv. Must execute on the thread's core.
+ */
+int  cos_thd_dealloc(struct cos_compinfo *ci, thdcap_t thd, vaddr_t kmem, thdid_t tid);
+/* Thread allocation that also returns the thread's kernel memory, for cos_thd_dealloc */
+thdcap_t cos_thd_alloc_ext_kmem(struct cos_compinfo *ci, compcap_t comp, thdclosure_index_t idx, vaddr_t *kmem);
+thdcap_t cos_initthd_alloc_kmem(struct cos_compinfo *ci, compcap_t comp, vaddr_t *kmem);
+/* Make a thread id available for reuse (the thread must be deallocated). */
+void cos_thd_id_free(thdid_t tid);
 
 pgtblcap_t cos_shared_pgtbl_alloc(void);
 u32_t cos_cons_into_shared_pgtbl(struct cos_compinfo *ci, pgtblcap_t top_lvl);

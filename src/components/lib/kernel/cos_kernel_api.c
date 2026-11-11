@@ -94,6 +94,87 @@ cos_meminfo_init(struct cos_meminfo *mi, vaddr_t untyped_ptr, unsigned long unty
 	mi->untyped_ptr = mi->umem_ptr = mi->kmem_ptr = mi->umem_frontier = mi->kmem_frontier = untyped_ptr;
 	mi->untyped_frontier = untyped_ptr + untyped_sz;
 	mi->pgtbl_cap        = pgtbl_cap;
+	mi->kmem_reclaim     = NULL;
+}
+
+/**************** [Reclamation rings] ****************/
+
+/*
+ * A FIFO of released resources (capability ids or kernel pages)
+ * tagged with their release time. FIFO order means that the head is
+ * the oldest entry, so it is the only one we need to check for
+ * quiescence. Protected by a spinlock: the critical sections are a
+ * few instructions long.
+ */
+static void
+__reclaim_ring_init(struct cos_reclaim_ring *r)
+{
+	memset(r, 0, sizeof(struct cos_reclaim_ring));
+	ps_lock_init(&r->lock);
+}
+
+static int
+__reclaim_ring_push(struct cos_reclaim_ring *r, word_t id)
+{
+	int ret = 0;
+
+	ps_lock_take(&r->lock);
+	if (r->tail - r->head == COS_RECLAIM_RING_SZ) {
+		/* Full: the resource is leaked, but remains safe. */
+		r->dropped++;
+		ret = -1;
+	} else {
+		r->ents[r->tail % COS_RECLAIM_RING_SZ] = (struct cos_reclaim_ent) {
+			.id = id,
+			.ts = ps_tsc(),
+		};
+		r->tail++;
+	}
+	ps_lock_release(&r->lock);
+
+	return ret;
+}
+
+/* Returns an id released at least KERN_QUIESCENCE_CYCLES ago, or 0 */
+static word_t
+__reclaim_ring_pop(struct cos_reclaim_ring *r)
+{
+	word_t ret = 0;
+	struct cos_reclaim_ent *e;
+
+	if (!r || ps_load(&r->head) == ps_load(&r->tail)) return 0;
+
+	ps_lock_take(&r->lock);
+	if (r->head != r->tail) {
+		e = &r->ents[r->head % COS_RECLAIM_RING_SZ];
+		if (QUIESCENCE_CHECK(ps_tsc(), e->ts, KERN_QUIESCENCE_CYCLES)) {
+			ret = e->id;
+			r->head++;
+		}
+	}
+	ps_lock_release(&r->lock);
+
+	return ret;
+}
+
+void
+cos_kmem_reclaim_init(struct cos_compinfo *ci, struct cos_reclaim_ring *r)
+{
+	assert(ci && r);
+
+	__reclaim_ring_init(r);
+	ci->mi.kmem_reclaim = r;
+}
+
+void
+cos_capid_reclaim_init(struct cos_compinfo *ci, struct cos_capid_reclaim *r)
+{
+	int i;
+
+	assert(ci && r);
+
+	for (i = 0; i < COS_RECLAIM_CAPSZ_NUM; i++) __reclaim_ring_init(&r->sz[i]);
+	ci->capid_reclaim = r;
 }
 
 static inline struct cos_compinfo *
@@ -178,6 +259,7 @@ cos_compinfo_init(struct cos_compinfo *ci, pgtblcap_t pgtbl_cap, captblcap_t cap
 	ci->cap_frontier 		= 0;
 	ci->comp_cap_shared 	= 0;
 	ci->pgtbl_cap_shared 	= 0;
+	ci->capid_reclaim       = NULL;
 	cos_vasfrontier_init(ci, heap_ptr);
 	cos_capfrontier_init(ci, cap_frontier);
 
@@ -244,7 +326,13 @@ error:
 static vaddr_t
 __kmem_bump_alloc(struct cos_compinfo *ci)
 {
+	vaddr_t kmem;
+
 	printd("__kmem_bump_alloc\n");
+	/* Reuse released (and quiesced) kernel memory first */
+	kmem = __reclaim_ring_pop(__compinfo_metacap(ci)->mi.kmem_reclaim);
+	if (kmem) return kmem;
+
 	return __mem_bump_alloc(ci, 1, 1);
 }
 
@@ -395,22 +483,36 @@ __capid_bump_alloc(struct cos_compinfo *ci, cap_t cap)
 {
 	unsigned long sz = captbl_idsize(cap);
 	capid_t *     frontier;
+	int           szidx;
+	capid_t       reused;
 
 	printd("__capid_bump_alloc\n");
 
 	switch (sz) {
 	case CAP16B_IDSZ:
 		frontier = &ci->cap16_frontier[cos_cpuid()];
+		szidx    = 0;
 		break;
 	case CAP32B_IDSZ:
 		frontier = &ci->cap32_frontier[cos_cpuid()];
+		szidx    = 1;
 		break;
 	case CAP64B_IDSZ:
 		frontier = &ci->cap64_frontier[cos_cpuid()];
+		szidx    = 2;
 		break;
 	default:
 		return -1;
 	}
+	/*
+	 * Reuse a released slot of the same size first. Slots of a
+	 * size stay that size: their cache-line was formatted for it.
+	 */
+	if (ci->capid_reclaim) {
+		reused = __reclaim_ring_pop(&ci->capid_reclaim->sz[szidx]);
+		if (reused) return reused;
+	}
+
 	return __capid_bump_alloc_generic(ci, frontier, sz);
 }
 
@@ -854,15 +956,53 @@ __alloc_mem_cap(struct cos_compinfo *ci, cap_t ct, vaddr_t *kmem, capid_t *cap)
  */
 unsigned long __thdid_alloc = NUM_CPU + 2;
 
+/*
+ * Released thread ids, reused before new ones. Thread ids index
+ * per-thread data in components (stacks, user-level invocation
+ * stacks, schedulers' thread tables), and must stay below
+ * MAX_NUM_THREADS, so they must be recycled for threads to be
+ * created and deleted indefinitely.
+ */
+static struct {
+	struct ps_lock lock;
+	unsigned long  n;
+	thdid_t        ids[MAX_NUM_THREADS];
+} __thdid_free;
+
+static void __cos_ulk_slot_reset(thdid_t tid);
+
 thdid_t
 cos_thd_id_alloc(void)
 {
-  unsigned long id = ps_faa(&__thdid_alloc, 1);
-  thdid_t assignment = (thdid_t)id;
+  unsigned long id;
+  thdid_t assignment = 0;
 
+  if (ps_load(&__thdid_free.n) > 0) {
+	  ps_lock_take(&__thdid_free.lock);
+	  if (__thdid_free.n > 0) assignment = __thdid_free.ids[--__thdid_free.n];
+	  ps_lock_release(&__thdid_free.lock);
+	  if (assignment) return assignment;
+  }
+
+  id = ps_faa(&__thdid_alloc, 1);
+  assignment = (thdid_t)id;
   assert((unsigned long)assignment == id);
 
   return assignment;
+}
+
+void
+cos_thd_id_free(thdid_t tid)
+{
+	assert(tid > 0 && tid < MAX_NUM_THREADS);
+
+	/* A new thread with this id must start with an empty user-level invocation stack */
+	__cos_ulk_slot_reset(tid);
+
+	ps_lock_take(&__thdid_free.lock);
+	assert(__thdid_free.n < MAX_NUM_THREADS);
+	__thdid_free.ids[__thdid_free.n++] = tid;
+	ps_lock_release(&__thdid_free.lock);
 }
 
 /*
@@ -872,19 +1012,39 @@ cos_thd_id_alloc(void)
  * in a more complex system, but this suffices for the ping-pong 
  * test.
  */
+#define ULK_NPAGES ((MAX_NUM_THREADS + ULK_STACKS_PER_PAGE - 1) / ULK_STACKS_PER_PAGE)
 struct {
 	pgtblcap_t toplvl;      /* for page allocation */
 	pgtblcap_t secondlvl;   /* for pgtbl mapping */
-	ulkcap_t   curr_pg;     /* current ulk page to alloc stacks in */
-	vaddr_t    pg_frontier; /* vaddr of next page to alloc */
+	/*
+	 * The user-level invocation stack of thread tid is at
+	 * ULK_BASE_ADDR + tid * sizeof(struct ulk_invstk) (see
+	 * COS_ULINV_GET_INVSTK), so the ULK page holding it is page
+	 * tid / ULK_STACKS_PER_PAGE of the region. Pages are allocated
+	 * on demand; thread ids can be reused in any order.
+	 */
+	ulkcap_t       pages[ULK_NPAGES];
+	struct ps_lock lock;
 } __cos_ulk_info;
 
 void
 cos_ulk_info_init(struct cos_compinfo *ci)
 {
+	ps_lock_init(&__cos_ulk_info.lock);
 	__cos_ulk_info.toplvl = cos_ulk_pgtbl_create(ci, &__cos_ulk_info.secondlvl);
-	__cos_ulk_info.pg_frontier = ULK_BASE_ADDR + __thdid_alloc * sizeof(struct ulk_invstk);
 	assert(__cos_ulk_info.toplvl);
+}
+
+static void
+__cos_ulk_slot_reset(thdid_t tid)
+{
+	struct ulk_invstk *stk;
+
+	/* Only possible if we manage the ULK region (it is then mapped into us) */
+	if (!__cos_ulk_info.toplvl || !__cos_ulk_info.pages[tid / ULK_STACKS_PER_PAGE]) return;
+
+	stk = (struct ulk_invstk *)(ULK_BASE_ADDR + tid * sizeof(struct ulk_invstk));
+	memset(stk, 0, sizeof(struct ulk_invstk));
 }
 
 pgtblcap_t
@@ -949,20 +1109,29 @@ cos_ulk_map_in(pgtblcap_t ptc)
 
 static ulkcap_t
 __cos_thd_ulk_page_alloc(struct cos_compinfo *ci, thdid_t tid)
-{	
-	if (!__cos_ulk_info.toplvl) return 0;
+{
+	unsigned long pg = tid / ULK_STACKS_PER_PAGE;
+	ulkcap_t      ulkcap;
 
-	if (!__cos_ulk_info.curr_pg || tid % ULK_STACKS_PER_PAGE == 0) {
-		__cos_ulk_info.curr_pg = cos_ulk_page_alloc(ci, __cos_ulk_info.toplvl, __cos_ulk_info.pg_frontier);
-		assert(__cos_ulk_info.curr_pg);
-		__cos_ulk_info.pg_frontier += PAGE_SIZE;
+	if (!__cos_ulk_info.toplvl) return 0;
+	assert(pg < ULK_NPAGES);
+
+	ulkcap = ps_load(&__cos_ulk_info.pages[pg]);
+	if (ulkcap) return ulkcap;
+
+	ps_lock_take(&__cos_ulk_info.lock);
+	if (!__cos_ulk_info.pages[pg]) {
+		__cos_ulk_info.pages[pg] = cos_ulk_page_alloc(ci, __cos_ulk_info.toplvl, ULK_BASE_ADDR + pg * PAGE_SIZE);
+		assert(__cos_ulk_info.pages[pg]);
 	}
-	
-	return __cos_ulk_info.curr_pg;
+	ulkcap = __cos_ulk_info.pages[pg];
+	ps_lock_release(&__cos_ulk_info.lock);
+
+	return ulkcap;
 }
 
 static thdcap_t
-__cos_thd_alloc(struct cos_compinfo *ci, compcap_t comp, thdclosure_index_t init_data, thdid_t tid)
+__cos_thd_alloc_kmem(struct cos_compinfo *ci, compcap_t comp, thdclosure_index_t init_data, thdid_t tid, vaddr_t *kmem_ret)
 {
 	ulkcap_t ulkcap;
 	vaddr_t  kmem;
@@ -981,8 +1150,41 @@ __cos_thd_alloc(struct cos_compinfo *ci, compcap_t comp, thdclosure_index_t init
 	ret = call_cap_op(ci->captbl_cap, CAPTBL_OP_THDACTIVATE, (init_data << 16) | cap,
 			  __compinfo_metacap(ci)->mi.pgtbl_cap << 16 | comp, kmem, ulkcap << 16 | tid);
 	if (ret) BUG();
+	if (kmem_ret) *kmem_ret = kmem;
 
 	return cap;
+}
+
+static thdcap_t
+__cos_thd_alloc(struct cos_compinfo *ci, compcap_t comp, thdclosure_index_t init_data, thdid_t tid)
+{
+	return __cos_thd_alloc_kmem(ci, comp, init_data, tid, NULL);
+}
+
+thdcap_t
+cos_thd_alloc_ext_kmem(struct cos_compinfo *ci, compcap_t comp, thdclosure_index_t idx, vaddr_t *kmem)
+{
+	thdid_t  tid;
+	thdcap_t ret;
+
+	if (idx < 1) return 0;
+	tid = cos_thd_id_alloc();
+	ret = __cos_thd_alloc_kmem(ci, comp, idx, tid, kmem);
+	if (!ret) cos_thd_id_free(tid);
+
+	return ret;
+}
+
+thdcap_t
+cos_initthd_alloc_kmem(struct cos_compinfo *ci, compcap_t comp, vaddr_t *kmem)
+{
+	thdid_t  tid = cos_thd_id_alloc();
+	thdcap_t ret;
+
+	ret = __cos_thd_alloc_kmem(ci, comp, 0, tid, kmem);
+	if (!ret) cos_thd_id_free(tid);
+
+	return ret;
 }
 
 #include <cos_thd_init.h>
@@ -1593,10 +1795,97 @@ cos_mem_alias_atn(struct cos_compinfo *dstci, vaddr_t dst, struct cos_compinfo *
 	return 0;
 }
 
+/*
+ * Liveness ids for unmaps. The kernel records the unmap time in the
+ * liveness entry and stores the id in the unmapped PTE (20 bits), so
+ * that the virtual address can only be mapped again after all TLBs
+ * have been flushed. A distinct id per unmap avoids a later unmap
+ * making an older one look recent. Ids rotate through a range above
+ * the ones used for capabilities (16 bits) and the booter's bump
+ * allocated ones, so an id is reused only after ~1M unmaps.
+ */
+#define COS_UNMAP_LID_BASE (1UL << 16)
+#define COS_UNMAP_LID_END  (1UL << 20)
+static unsigned long __unmap_lid = 0;
+
 int
 cos_mem_remove(pgtblcap_t pt, vaddr_t addr)
 {
-	assert(0);
+	unsigned long lid = COS_UNMAP_LID_BASE + (ps_faa(&__unmap_lid, 1) % (COS_UNMAP_LID_END - COS_UNMAP_LID_BASE));
+
+	return call_cap_op(pt, CAPTBL_OP_MEMDEACTIVATE, addr, lid, 0, 0);
+}
+
+int
+cos_capid_free(struct cos_compinfo *ci, capid_t cap, cap_t type)
+{
+	int szidx;
+
+	assert(ci && cap);
+	if (!ci->capid_reclaim) return -1;
+
+	switch (captbl_idsize(type)) {
+	case CAP16B_IDSZ: szidx = 0; break;
+	case CAP32B_IDSZ: szidx = 1; break;
+	case CAP64B_IDSZ: szidx = 2; break;
+	default: return -EINVAL;
+	}
+
+	return __reclaim_ring_push(&ci->capid_reclaim->sz[szidx], cap);
+}
+
+int
+cos_kmem_free(struct cos_compinfo *ci, vaddr_t kmem)
+{
+	struct cos_compinfo *meta = __compinfo_metacap(ci);
+
+	assert(kmem && round_to_page(kmem) == kmem);
+	if (!meta->mi.kmem_reclaim) return -1;
+
+	return __reclaim_ring_push(meta->mi.kmem_reclaim, kmem);
+}
+
+int
+cos_cap_deactivate(struct cos_compinfo *ci, capid_t cap, cap_t type)
+{
+	syscall_op_t op;
+	int          ret;
+
+	assert(ci && cap);
+	switch (type) {
+	case CAP_THD:  op = CAPTBL_OP_THDDEACTIVATE;  break;
+	case CAP_ARCV: op = CAPTBL_OP_ARCVDEACTIVATE; break;
+	case CAP_ASND: op = CAPTBL_OP_ASNDDEACTIVATE; break;
+	case CAP_SINV: op = CAPTBL_OP_SINVDEACTIVATE; break;
+	default: return -EINVAL;
+	}
+
+	/*
+	 * Liveness id 0: the kernel doesn't track this slot's
+	 * quiescence, the reclamation ring delays its reuse instead.
+	 */
+	ret = call_cap_op(ci->captbl_cap, op, cap, 0, 0, 0);
+	if (ret) return ret;
+	cos_capid_free(ci, cap, type);
+
+	return 0;
+}
+
+int
+cos_thd_dealloc(struct cos_compinfo *ci, thdcap_t thd, vaddr_t kmem, thdid_t tid)
+{
+	struct cos_compinfo *meta = __compinfo_metacap(ci);
+	int ret;
+
+	assert(ci && thd && kmem);
+	/* The kernel returns kmem to its cos frame in our memory pgtbl, and zeroes it */
+	ret = call_cap_op(ci->captbl_cap, CAPTBL_OP_THDDEACTIVATE_ROOT, thd, 0, meta->mi.pgtbl_cap, kmem);
+	if (ret) return ret;
+
+	cos_capid_free(ci, thd, CAP_THD);
+	cos_kmem_free(ci, kmem);
+	if (tid) cos_thd_id_free(tid);
+
 	return 0;
 }
 
@@ -1724,6 +2013,12 @@ int
 cos_hw_tlbflush(hwcap_t hwc)
 {
 	return call_cap_op(hwc, CAPTBL_OP_HW_TLBFLUSH, 0, 0, 0, 0);
+}
+
+int
+cos_hw_tlb_quiescent(hwcap_t hwc, u64_t ts)
+{
+	return call_cap_op(hwc, CAPTBL_OP_HW_TLB_QUIESCENT, ts, 0, 0, 0);
 }
 
 int
