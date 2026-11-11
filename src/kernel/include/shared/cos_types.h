@@ -659,8 +659,28 @@ struct vm_vcpu_shared_region {
 	u64_t microcode_version;
 	u16_t inject_evt;
 
+	/*
+	 * Initial real-mode entry state for a vCPU, consumed by the kernel on the
+	 * vCPU's first VM entry only, and only if init_valid ==
+	 * VM_VCPU_INIT_VALID. The VMM sets these for application processors from
+	 * the STARTUP IPI vector before starting the vCPU; zero (the default
+	 * after vCPU creation) keeps the BSP's 0x1000 entry point.
+	 */
+	u64_t init_valid;
+	u64_t init_cs_sel;
+	u64_t init_cs_base;
+	u64_t init_rip;
+
 	struct vm_pi_desc pi_desc __attribute__((aligned(CACHE_LINE))); /* posted interrupt support, which is essentially an interface to record interrupt vectors */
 };
+
+#define VM_VCPU_INIT_VALID 0x5349504956414c44ULL /* "DLAVIPIS" */
+
+/*
+ * The kernel copies the guest GPRs saved on VM exit (cr2 .. ax, pushed by
+ * vmx_exit_handler_asm) into the head of the shared region; this is their size.
+ */
+#define VM_VCPU_SHARED_GPRS_SZ (16 * sizeof(u64_t))
 
 enum {
 	PAGE_VMCS,

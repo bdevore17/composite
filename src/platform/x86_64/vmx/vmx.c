@@ -23,15 +23,83 @@ u64_t cr4_fixed0_bits = 0;
 u64_t cr0_fixed1_bits = 0;
 u64_t cr0_fixed0_bits = 0;
 
-/* Note: this page is just used for enabling cpu vm capability, it doesn't relate to vcpu VMCS pages */
-static char vm_env_page[PAGE_SIZE_4K] __attribute__((aligned(PAGE_SIZE_4K)));
+/*
+ * The VMXON regions, one per logical processor. They are only used to enable
+ * VMX operation and are unrelated to the per-vCPU VMCS pages. This used to be
+ * a single page shared by every core, but each core executes VMXON (via
+ * chal_cpu_init()), and the SDM requires a separate VMXON region per logical
+ * processor that software does not touch between VMXON and VMXOFF (SDM Vol.3,
+ * "VMXON Region"); the old code also re-zeroed the region another core
+ * was already using.
+ */
+static char vm_env_page[NUM_CPU][PAGE_SIZE_4K] __attribute__((aligned(PAGE_SIZE_4K)));
+
+/*
+ * The VMCS that is current (VMPTRLD'ed) on each core, or NULL. A vCPU thread
+ * never migrates (cap_thd_switch only switches to threads of the current
+ * core), but several vCPU threads may share a core, so before touching a
+ * thread's VMCS we have to make sure it is the current one on this core.
+ */
+static void *vmx_current_vmcs[NUM_CPU];
+
+/* IA32_VMX_EPT_VPID_CAP, read once at boot; see vmx_ept_caps_init(). */
+u64_t vmx_ept_vpid_cap = 0;
+
+static void
+vmx_ept_caps_init(void)
+{
+	u64_t cap = msr_get(IA32_VMX_EPT_VPID_CAP);
+
+	vmx_ept_vpid_cap = cap;
+	if (get_cpuid() != INIT_CORE) return;
+
+	/*
+	 * SDM Vol.3, appendix "VPID and EPT Capabilities". The EPTP we build in vmx_thd_init() relies on
+	 * a 4-level walk (bit 6) and the WB memory type (bit 14); warn loudly if
+	 * the CPU lacks either, rather than failing later with an opaque VM-entry
+	 * error. Bits 16/17 say whether EPT PDEs/PDPTEs may map 2MB/1GB pages;
+	 * those are not used yet (see simple_vmm/vm_fixme.md, "EPT").
+	 */
+	VMX_INFO("IA32_VMX_EPT_VPID_CAP: 0x%p (4-level walk: %d, WB: %d, 2MB pages: %d, 1GB pages: %d)\n",
+	         cap, !!(cap & VMX_EPT_CAP_PWL4), !!(cap & VMX_EPT_CAP_WB), !!(cap & VMX_EPT_CAP_2MB),
+	         !!(cap & VMX_EPT_CAP_1GB));
+	if (!(cap & VMX_EPT_CAP_PWL4) || !(cap & VMX_EPT_CAP_WB)) {
+		VMX_WARN("EPT lacks 4-level walks or WB memory type: VM entry will fail\n");
+	}
+}
 
 void
 vmx_env_init(void)
 {
+	cpuid_t cpu = get_cpuid();
+
 	assert(sizeof(struct vm_vcpu_shared_region) < PAGE_SIZE_4K);
-	memset(&vm_env_page, 0, PAGE_SIZE_4K);
-	vmx_on(&vm_env_page);
+	assert(cpu < NUM_CPU);
+	memset(vm_env_page[cpu], 0, PAGE_SIZE_4K);
+	vmx_current_vmcs[cpu] = NULL;
+	vmx_on(vm_env_page[cpu]);
+	vmx_ept_caps_init();
+}
+
+/*
+ * Make the VMCS of `thd` the current VMCS on this core (SDM Vol.3, "Software Use of
+ * Virtual-Machine Control Structures").
+ * Called before any VMREAD/VMWRITE/VMLAUNCH/VMRESUME on behalf of `thd`.
+ */
+static inline void
+vmx_vmcs_make_current(struct thread *thd)
+{
+	cpuid_t cpu  = get_cpuid();
+	void   *vmcs = thd->vcpu_ctx.vmcs.vmcs;
+
+	vmx_assert(vmcs);
+	/* The VMCS is only ever active on the core the vCPU thread belongs to. */
+	vmx_assert(thd->cpuid == cpu);
+	if (likely(vmx_current_vmcs[cpu] == vmcs)) return;
+
+	VMX_DEBUG("core %u: switching current VMCS 0x%p -> 0x%p (tid %u)\n", cpu, vmx_current_vmcs[cpu], vmcs, thd->tid);
+	load_vmcs(vmcs);
+	vmx_current_vmcs[cpu] = vmcs;
 }
 
 void
@@ -79,10 +147,11 @@ vmx_host_state_init(void)
 }
 
 void
-vmx_guest_state_init(void)
+vmx_guest_state_init(struct thread *thd)
 {
 	/* Initializing guest state, this will set guest into real mode */
 	u64_t tmp64;
+	struct vm_vcpu_shared_region *shared_region = thd->vm_vcpu_shared_region;
 
 	vmwrite(GUEST_ES, 0x0);
 	vmwrite(GUEST_CS, 0x0);
@@ -170,6 +239,27 @@ vmx_guest_state_init(void)
 
 	/* The initial guest ip will be at 0x1000 */
 	vmwrite(GUEST_RIP, 0x1000); 
+
+	/*
+	 * An application processor does not start at 0x1000: the VMM starts its
+	 * vCPU thread only once the guest sent it a STARTUP IPI, and the SIPI
+	 * vector V selects the real-mode entry point (SDM Vol.3, "Multiple-
+	 * Processor (MP) Initialization" and "Interrupt Command Register"):
+	 * CS.selector = V << 8,
+	 * CS.base = V << 12, RIP = 0, everything else as after INIT. The VMM
+	 * passes those in the shared region; the BSP leaves init_valid zero and
+	 * keeps the historical 0x1000 entry.
+	 */
+	if (shared_region && shared_region->init_valid == VM_VCPU_INIT_VALID) {
+		vmx_assert(shared_region->init_cs_base == (shared_region->init_cs_sel << 4));
+		vmx_assert(shared_region->init_cs_sel <= 0xFFFF);
+		vmwrite(GUEST_CS, shared_region->init_cs_sel);
+		vmwrite(GUEST_CS_BASE, shared_region->init_cs_base);
+		vmwrite(GUEST_RIP, shared_region->init_rip);
+		VMX_INFO("vCPU thd %u starts at CS %x:%x (base 0x%p)\n", thd->tid,
+		         (u32_t)shared_region->init_cs_sel, (u32_t)shared_region->init_rip,
+		         shared_region->init_cs_base);
+	}
 
 	vmwrite(GUEST_RFLAG, 0x2);
 
@@ -332,7 +422,15 @@ vmx_thd_init(struct thread *thd, void *vm_pgd, struct cap_vm_vmcb *vmcb)
 	vmcs->vmcs = vmcs_page;
 
 	*(u32_t *)vmcs_page = vmx_get_revision_id();
+	/*
+	 * VMCLEAR initialises the VMCS (its launch state becomes "clear", so the
+	 * first entry must be VMLAUNCH) before the first VMPTRLD, as SDM Vol.3
+	 * ("Initializing a VMCS") requires. This runs on the core that creates the thread, which
+	 * is the core it will run on (thd->cpuid == get_cpuid()).
+	 */
+	clear_vmcs(vmcs_page);
 	load_vmcs(vmcs_page);
+	vmx_current_vmcs[get_cpuid()] = vmcs_page;
 	VMX_DEBUG("VMCS PAGE: 0x%p\n", vmcs->vmcs);
 
 	vmcs->vapic = lapic;
@@ -396,11 +494,12 @@ vmx_thd_start_or_resume(struct thread *thd)
 	
 	VMX_DEBUG("Starting or resuming VM thread: 0x%p, tid: %u, coreid:%u\n", thd, thd->tid, thd->cpuid);
 
+	vmx_vmcs_make_current(thd);
 	vmx_resume(thd);
 	assert(thd->vcpu_ctx.state == VM_THD_STATE_STOPPED);
 
 	vmx_host_state_init();
-	vmx_guest_state_init();
+	vmx_guest_state_init(thd);
 	vmx_pinbased_ctl_init();
 	vmx_procbased_ctl_init();
 	vmx_vm_exit_ctl_init();

@@ -11,6 +11,11 @@
 #include <vmx_exit.h>
 
 void lapic_ack(void);
+void lapic_selfipi(u8_t vector);
+
+/* The GPR block pushed by vmx_exit_handler_asm must match the shared region's head. */
+_Static_assert(__builtin_offsetof(struct vm_vcpu_shared_region, reason) == VM_VCPU_SHARED_GPRS_SZ,
+               "vm_vcpu_shared_region GPR layout does not match vmx_exit_handler_asm");
 void restore_from_vm(void);
 int cap_thd_switch(struct pt_regs *regs, struct thread *curr, struct thread *next,
 			struct comp_info *ci, struct cos_cpu_local_info *cos_info);
@@ -38,7 +43,7 @@ posted_intr_handler(struct pt_regs *regs)
 static void
 posted_intr_inject(void)
 {
-	chal_selfipi(HW_LAPIC_POSTED_INTR);
+	lapic_selfipi(HW_LAPIC_POSTED_INTR);
 }
 
 
@@ -209,8 +214,14 @@ vmx_exit_handler(struct vm_vcpu_shared_region *regs)
 	vmx_assert(reason_nr < MAX_VM_EXIT_REASONS);
 	VMX_DEBUG("VM thd: %u on core: %u get VM-exit (reason: ) on handler: %u\n", thd_curr->tid, cos_info->cpuid, reason_nr, thd_exception_handler->tid);
 
-	/* Share GPs with VMM */
-	memcpy(shared_region, regs, sizeof(struct vm_vcpu_shared_region));
+	/*
+	 * Share GPs with VMM. Only the GPR block that vmx_exit_handler_asm pushed
+	 * is valid at `regs`: copying the whole structure (as this used to) read
+	 * past the top of the kernel stack and overwrote the rest of the shared
+	 * region -- microcode_version, the vCPU start state and the posted
+	 * interrupt descriptor -- with whatever lay there.
+	 */
+	memcpy(shared_region, regs, VM_VCPU_SHARED_GPRS_SZ);
 
 	shared_region->reason = reason_nr;
 	shared_region->ip = vmread(GUEST_RIP);
@@ -249,9 +260,21 @@ vmx_exit_handler(struct vm_vcpu_shared_region *regs)
 			break;
 
 		case HW_LAPIC_IPI_ASND:
-			/* TODO: IPI handling during VM execution - not yet implemented/tested */
-			VMX_DEBUG("IPI interrupt (vector %d) during VM execution - not yet supported\n", vector);
-			vmx_assert(0);
+			/*
+			 * A cross-core asynchronous send (e.g. a scheduler wakeup or
+			 * a VMM kicking this vCPU) arrived while the guest ran. With
+			 * "acknowledge interrupt on exit" the vector was consumed by
+			 * the VM exit, so re-raise it as a self-IPI: it stays pending
+			 * (IF is 0 in the kernel) and is taken in host context as soon
+			 * as we return to the exception handler thread, which then
+			 * goes through the ordinary lapic_ipi_asnd_handler() ->
+			 * cap_ipi_process() path with a host thread current. Then hand
+			 * the exit to the handler like any other.
+			 */
+			VMX_DEBUG("VM thd %u: asnd IPI during guest execution, re-raised\n", thd_curr->tid);
+			lapic_selfipi(HW_LAPIC_IPI_ASND);
+			ret = cap_thd_switch(&tmp_regs[cpuid], thd_curr, thd_exception_handler, NULL, cos_info);
+			vmx_assert(ret == 0);
 			break;
 
 		case HW_LAPIC_POSTED_INTR:

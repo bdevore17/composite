@@ -164,6 +164,23 @@
 #define ENTRY_LOAD_IA32_PAT			BIT(14)
 #define ENTRY_LOAD_IA32_EFER			BIT(15)
 
+/* IA32_VMX_EPT_VPID_CAP bits (SDM Vol.3, appendix "VPID and EPT Capabilities") */
+#define VMX_EPT_CAP_PWL4			(1ULL << 6)
+#define VMX_EPT_CAP_WB				(1ULL << 14)
+#define VMX_EPT_CAP_2MB				(1ULL << 16)
+#define VMX_EPT_CAP_1GB				(1ULL << 17)
+
+/*
+ * VMCLEAR: flush any cached state of the VMCS to memory, mark it inactive and
+ * set its launch state to "clear" (SDM Vol.3, "Initializing a VMCS" and the VMCLEAR reference).
+ */
+static inline void
+clear_vmcs(u8_t *vmcs)
+{
+	u64_t pa = chal_va2pa(vmcs);
+	__asm__ volatile ("vmclear (%%rax)": : "a"(&pa) : "memory", "cc");
+}
+
 static inline void
 load_vmcs(u8_t *vmcs)
 {

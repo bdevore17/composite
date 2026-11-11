@@ -1264,22 +1264,29 @@ static sword_t __attribute__((noinline)) composite_syscall_slowpath(struct pt_re
 			struct cap_pgtbl  *pgtblc;
 			word_t            flags;
 
+			/*
+			 * The APIC-access page is per VM, not per vCPU: every vCPU's
+			 * VMCS points at the same frame, which is also mapped into the
+			 * VM's EPT at the guest's LAPIC base (SDM Vol.3, "Virtualizing
+			 * Memory-Mapped APIC Accesses"). The
+			 * frame is already kernel memory (it was activated when it was
+			 * mapped into the EPT), so for every vCPU -- the first one
+			 * included -- activation reports -EEXIST (or -ECASFAIL if
+			 * another core raced us) and we just look the page up. Each
+			 * vCPU still gets its own CAP_VM_LAPIC_ACCESS capability.
+			 */
 			ret = cap_kmem_activate(ct, pgtbl_cap, pgtbl_addr, (unsigned long *)&page, &pte);
 			if (ret == -EEXIST || ret == -ECASFAIL) {
-				/* apic access mem has been activated by other vcpu, thus just get the page addr */
+				pte    = NULL; /* nothing of ours to undo */
 				pgtblc = (struct cap_pgtbl *)captbl_lkup(ct, pgtbl_cap);
+				if (unlikely(!pgtblc || pgtblc->h.type != CAP_PGTBL)) cos_throw(err, -EINVAL);
 				page = (vaddr_t)pgtbl_lkup(pgtblc->pgtbl, pgtbl_addr & PGTBL_FRAME_MASK, &flags);
-				assert(page);
+				if (unlikely(!page)) cos_throw(err, -ENOENT);
 				ret = 0;
 			}
 
-			if (likely(!ret)) {
-				ret = vm_lapic_access_activate(ct, cap, lapic_access_cap, page);
-				/* TODO: improve it for multi-vcpu case */
-				assert(!ret);
-			}
-			assert(!ret);
-			if (ret) kmem_unalloc(pte);
+			if (likely(!ret)) ret = vm_lapic_access_activate(ct, cap, lapic_access_cap, page);
+			if (ret && pte) kmem_unalloc(pte);
 
 			break;
 		}
