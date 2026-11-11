@@ -381,9 +381,11 @@ thd_activate(struct captbl *t, capid_t cap, capid_t capin, struct thread *thd, c
 	compc = (struct cap_comp *)captbl_lkup(t, compcap);
 	if (unlikely(!compc || compc->h.type != CAP_COMP)) return -EINVAL;
 
+	type = compc->pgd->type;
+	if (unlikely(type == THD_TYPE_VM && !vm_env_available())) return -EPERM;
+
 	tc = (struct cap_thd *)__cap_capactivate_pre(t, cap, capin, CAP_THD, &ret);
 	if (!tc) return ret;
-	type = compc->pgd->type;
 
 	/* initialize the thread */
 	memcpy(&(thd->invstk[0].comp_info), &compc->info, sizeof(struct comp_info));
