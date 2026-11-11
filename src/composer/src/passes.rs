@@ -241,6 +241,11 @@ pub struct Component {
     pub params: Vec<ArgsKV>, // initialization parameters
     pub fsimg: Option<String>,
     pub constants: Vec<ConstantVal>,
+    // Deferred components (`boot = "deferred"`) are built, linked,
+    // and created in the image like all others, but are not
+    // initialized at boot: they are started (and stopped) at runtime
+    // through their scheduler's `loader` interface.
+    pub deferred: bool,
 }
 
 // Input/frontend pass taking the specification, and outputing the

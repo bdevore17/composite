@@ -45,7 +45,11 @@ pub struct TomlComponent {
     implements: Option<Vec<InterfaceVariant>>,
     initfs: Option<String>,
     constructor: String, // the booter
+    boot: Option<String>, // "boot" (default) or "deferred" (started at runtime)
 }
+
+pub const BOOT_AT_BOOT: &str = "boot";
+pub const BOOT_DEFERRED: &str = "deferred";
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -99,6 +103,18 @@ impl TomlComponent {
 
     pub fn interfaces(&self) -> &Vec<InterfaceVariant> {
         self.implements.as_ref().unwrap()
+    }
+
+    pub fn is_deferred(&self) -> bool {
+        self.boot.as_ref().map_or(false, |b| b == BOOT_DEFERRED)
+    }
+
+    // The component we depend on for initialization (our scheduler),
+    // if not the kernel.
+    fn init_server(&self) -> Option<&Dep> {
+        self.deps()
+            .iter()
+            .find(|d| d.interface == "init" && d.srv != "kernel")
     }
 }
 
@@ -370,10 +386,116 @@ impl TomlSpecification {
             fail = true;
         }
 
+        if let Err(e) = self.validate_deferred() {
+            err_accum.push_str(&e);
+            fail = true;
+        }
+
         if fail {
             Err(err_accum)
         } else {
             Ok(())
+        }
+    }
+
+    // Deferred components (`boot = "deferred"`) are created by the
+    // base constructor (booter) at boot, but initialized only when
+    // their scheduler starts them at runtime (see the `loader`
+    // interface). This constrains them to be "leaf" application
+    // components:
+    //
+    // - they are constructed by the base constructor,
+    // - they depend on a scheduler (that is not the booter, and is
+    //   not itself deferred) for `init`, which starts them,
+    // - they depend on the capmgr (`capmgr` or `capmgr_create`) that
+    //   manages their memory and threads,
+    // - they are not a scheduler, capmgr, or constructor of other
+    //   components, and
+    // - they are not in a shared address space.
+    //
+    // Other components can depend on them as servers: until they are
+    // started, invocations of their functions fail with -ENOENT.
+    fn validate_deferred(&self) -> Result<(), String> {
+        let mut errs = String::new();
+
+        for c in self.comps() {
+            match c.boot.as_ref().map(|s| s.as_str()) {
+                None | Some(BOOT_AT_BOOT) | Some(BOOT_DEFERRED) => (),
+                Some(b) => errs.push_str(&format!(
+                    "Error: Component {} has boot = \"{}\", which must be \"{}\" or \"{}\".\n",
+                    c.name, b, BOOT_AT_BOOT, BOOT_DEFERRED
+                )),
+            }
+            if !c.is_deferred() {
+                continue;
+            }
+
+            let base = self.comp(c.constructor.clone());
+            if c.constructor == "kernel" || base.map_or(true, |b| b.constructor != "kernel") {
+                errs.push_str(&format!(
+                    "Error: Deferred component {} must be constructed by the base constructor (booter).\n",
+                    c.name
+                ));
+            } else if !base.unwrap().interfaces().iter().any(|i| i.interface == "addr") {
+                // the booter loads deferred components through its addr interface
+                errs.push_str(&format!(
+                    "Error: Deferred component {}'s constructor {} must implement the addr interface.\n",
+                    c.name, c.constructor
+                ));
+            }
+            match c.init_server() {
+                None => errs.push_str(&format!(
+                    "Error: Deferred component {} must depend on a scheduler for the init interface.\n",
+                    c.name
+                )),
+                Some(d) => {
+                    if d.srv == c.constructor {
+                        errs.push_str(&format!("Error: Deferred component {} depends on its constructor ({}) for init, but must depend on a scheduler that starts it.\n", c.name, d.srv));
+                    }
+                    if self.comp(d.srv.clone()).map_or(false, |s| s.is_deferred()) {
+                        errs.push_str(&format!(
+                            "Error: Deferred component {}'s scheduler {} cannot be deferred.\n",
+                            c.name, d.srv
+                        ));
+                    }
+                }
+            }
+            if !c
+                .deps()
+                .iter()
+                .any(|d| d.interface == "capmgr" || d.interface == "capmgr_create")
+            {
+                errs.push_str(&format!("Error: Deferred component {} must depend on a capability manager (capmgr or capmgr_create interface) that manages its resources.\n", c.name));
+            }
+            for other in self.comps() {
+                if other
+                    .deps()
+                    .iter()
+                    .any(|d| d.srv == c.name && ["init", "capmgr", "capmgr_create"].contains(&d.interface.as_str()))
+                {
+                    errs.push_str(&format!("Error: Deferred component {} cannot be a scheduler or capability manager (component {} depends on it for init or capmgr).\n", c.name, other.name));
+                }
+                if other.constructor == c.name {
+                    errs.push_str(&format!(
+                        "Error: Deferred component {} cannot be the constructor of {}.\n",
+                        c.name, other.name
+                    ));
+                }
+            }
+            if let Some(ases) = self.ases() {
+                if ases.iter().any(|a| a.components.contains(&c.name)) {
+                    errs.push_str(&format!(
+                        "Error: Deferred component {} cannot be in a shared address space.\n",
+                        c.name
+                    ));
+                }
+            }
+        }
+
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs)
         }
     }
 
@@ -392,8 +514,11 @@ impl TomlSpecification {
     pub fn parse(sysspec_path: &String) -> Result<TomlSpecification, String> {
         let conf = dump_file(&sysspec_path)?;
         // This is BRAIN DEAD.  There has to be a better way to get a str
-        let cossys_pre: Result<TomlSpecification, _> =
-            toml::from_str(String::from_utf8(conf).unwrap().as_str());
+        Self::parse_str(String::from_utf8(conf).unwrap().as_str())
+    }
+
+    pub fn parse_str(spec: &str) -> Result<TomlSpecification, String> {
+        let cossys_pre: Result<TomlSpecification, _> = toml::from_str(spec);
 
         if let Err(cs) = cossys_pre {
             let mut e = String::from("Error when parsing TOML:\n");
@@ -473,7 +598,13 @@ impl Transition for SystemSpec {
             return Err(e);
         }
 
-        let spec = spec_err.unwrap();
+        SystemSpec::from_toml(spec_err.unwrap())
+    }
+}
+
+impl SystemSpec {
+    // Create the system description from a validated specification.
+    fn from_toml(spec: TomlSpecification) -> Result<Box<Self>, String> {
         let ids = spec
             .comps()
             .iter()
@@ -555,6 +686,7 @@ impl Transition for SystemSpec {
                     .collect(),
                 fsimg: c.initfs.clone(),
                 constants: c.constants.as_ref().unwrap_or(&Vec::new()).clone(),
+                deferred: c.is_deferred(),
             };
             components.insert(ComponentName::new(&c.name, &String::from("global")), comp);
             deps.insert(ComponentName::new(&c.name, &String::from("global")), ds);
@@ -657,5 +789,178 @@ impl SpecificationPass for SystemSpec {
 
     fn address_spaces(&self) -> &HashMap<AddrSpcName, AddrSpace> {
         &self.address_spaces
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A minimal booter/capmgr/sched system, followed by `extra`
+    // components.
+    fn system(extra: &str) -> String {
+        format!(
+            r#"
+[system]
+description = "test"
+
+[[components]]
+name = "booter"
+img  = "no_interface.llbooter"
+implements = [{{interface = "init"}}, {{interface = "addr"}}]
+deps = [{{srv = "kernel", interface = "init", variant = "kernel"}}]
+constructor = "kernel"
+
+[[components]]
+name = "capmgr"
+img  = "capmgr.simple"
+deps = [{{srv = "booter", interface = "init"}}, {{srv = "booter", interface = "addr"}}]
+implements = [{{interface = "capmgr"}}, {{interface = "init"}}, {{interface = "memmgr"}}, {{interface = "capmgr_create"}}]
+constructor = "booter"
+
+[[components]]
+name = "sched"
+img  = "sched.pfprr_quantum_static"
+deps = [{{srv = "capmgr", interface = "init"}}, {{srv = "capmgr", interface = "capmgr"}}, {{srv = "capmgr", interface = "memmgr"}}]
+implements = [{{interface = "sched"}}, {{interface = "init"}}, {{interface = "loader"}}]
+constructor = "booter"
+{}
+"#,
+            extra
+        )
+    }
+
+    fn app(name: &str, boot: &str, deps: &str, implements: &str) -> String {
+        format!(
+            r#"
+[[components]]
+name = "{}"
+img  = "tests.{}"
+deps = [{}]
+implements = [{}]
+constructor = "booter"
+{}
+"#,
+            name, name, deps, implements, boot
+        )
+    }
+
+    const APP_DEPS: &str = r#"{srv = "sched", interface = "init"}, {srv = "sched", interface = "sched"}, {srv = "capmgr", interface = "capmgr_create"}"#;
+
+    fn parse(extra: &str) -> Result<TomlSpecification, String> {
+        TomlSpecification::parse_str(&system(extra))
+    }
+
+    fn deferred_server() -> String {
+        app(
+            "server",
+            r#"boot = "deferred""#,
+            APP_DEPS,
+            r#"{interface = "pong"}"#,
+        )
+    }
+
+    #[test]
+    fn boot_defaults_to_boot_time() {
+        let spec = parse(&app("a", "", APP_DEPS, "")).unwrap();
+        assert!(!spec.comp("a".to_string()).unwrap().is_deferred());
+        let spec = parse(&app("a", r#"boot = "boot""#, APP_DEPS, "")).unwrap();
+        assert!(!spec.comp("a".to_string()).unwrap().is_deferred());
+    }
+
+    #[test]
+    fn deferred_server_with_clients() {
+        let client_deps = format!(
+            r#"{}, {{srv = "server", interface = "pong"}}, {{srv = "sched", interface = "loader"}}"#,
+            APP_DEPS
+        );
+        let extra = format!("{}{}", deferred_server(), app("client", "", &client_deps, ""));
+        let spec = parse(&extra).unwrap();
+        assert!(spec.comp("server".to_string()).unwrap().is_deferred());
+        assert!(!spec.comp("client".to_string()).unwrap().is_deferred());
+
+        // The deferred flag is carried into the component description
+        let sys = SystemSpec::from_toml(spec).unwrap();
+        let name = |n: &str| ComponentName::new(&n.to_string(), &String::from("global"));
+        assert!(sys.component_named(&name("server")).deferred);
+        assert!(!sys.component_named(&name("client")).deferred);
+        assert!(!sys.component_named(&name("sched")).deferred);
+    }
+
+    #[test]
+    fn invalid_boot_value() {
+        let e = parse(&app("a", r#"boot = "later""#, APP_DEPS, "")).err().unwrap();
+        assert!(e.contains("boot = \"later\""), "{}", e);
+    }
+
+    #[test]
+    fn deferred_needs_a_scheduler() {
+        // initialized by the booter
+        let deps = r#"{srv = "booter", interface = "init"}, {srv = "capmgr", interface = "capmgr_create"}"#;
+        let e = parse(&app("a", r#"boot = "deferred""#, deps, "")).err().unwrap();
+        assert!(e.contains("depends on its constructor"), "{}", e);
+
+        // no init dependency at all
+        let deps = r#"{srv = "capmgr", interface = "capmgr_create"}"#;
+        let e = parse(&app("a", r#"boot = "deferred""#, deps, "")).err().unwrap();
+        assert!(e.contains("must depend on a scheduler"), "{}", e);
+    }
+
+    #[test]
+    fn deferred_needs_a_capmgr() {
+        let deps = r#"{srv = "sched", interface = "init"}, {srv = "sched", interface = "sched"}"#;
+        let e = parse(&app("a", r#"boot = "deferred""#, deps, "")).err().unwrap();
+        assert!(e.contains("capability manager"), "{}", e);
+    }
+
+    #[test]
+    fn deferred_cannot_be_a_scheduler() {
+        let extra = format!(
+            "{}{}",
+            app("s2", r#"boot = "deferred""#, APP_DEPS, r#"{interface = "init"}"#),
+            app("a", "", r#"{srv = "s2", interface = "init"}"#, "")
+        );
+        let e = parse(&extra).err().unwrap();
+        assert!(e.contains("cannot be a scheduler"), "{}", e);
+    }
+
+    #[test]
+    fn deferred_scheduler_and_constructor_are_rejected() {
+        // The system's scheduler cannot be deferred
+        let spec = system(&app("a", "", APP_DEPS, "")).replace(
+            "implements = [{interface = \"sched\"}",
+            "boot = \"deferred\"\nimplements = [{interface = \"sched\"}",
+        );
+        let e = TomlSpecification::parse_str(&spec).err().unwrap();
+        assert!(e.contains("Deferred component sched"), "{}", e);
+
+        // The booter cannot be deferred
+        let spec = system("").replace(
+            "constructor = \"kernel\"",
+            "constructor = \"kernel\"\nboot = \"deferred\"",
+        );
+        let e = TomlSpecification::parse_str(&spec).err().unwrap();
+        assert!(e.contains("base constructor"), "{}", e);
+    }
+
+    #[test]
+    fn deferred_needs_a_booter_with_addr() {
+        let spec = system(&deferred_server()).replace(
+            r#"implements = [{interface = "init"}, {interface = "addr"}]"#,
+            r#"implements = [{interface = "init"}]"#,
+        );
+        let e = TomlSpecification::parse_str(&spec).err().unwrap();
+        assert!(e.contains("must implement the addr interface"), "{}", e);
+    }
+
+    #[test]
+    fn deferred_in_shared_address_space() {
+        let extra = format!(
+            "{}{}\n[[address_spaces]]\nname = \"as\"\ncomponents = [\"server\", \"other\"]\n",
+            deferred_server(),
+            app("other", "", APP_DEPS, "")
+        );
+        let e = parse(&extra).err().unwrap();
+        assert!(e.contains("shared address space"), "{}", e);
     }
 }

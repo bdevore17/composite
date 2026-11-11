@@ -1,6 +1,6 @@
 use initargs::ArgsKV;
 use passes::{
-    component, BuildState, ComponentId, OrderedSpecPass, PropertiesPass, ResPass, ServiceType,
+    component, deps, BuildState, ComponentId, OrderedSpecPass, PropertiesPass, ResPass, ServiceType,
     SystemState, Transition,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -122,7 +122,9 @@ fn sched_config_clients(s: &SystemState, id: &ComponentId) -> Vec<ArgsKV> {
 
     assert!(props.service_is_a(&id, ServiceType::Scheduler));
     if let Some(cs) = clients {
-        for c in cs.iter() {
+        // Deferred components are not initialized at boot: they are
+        // started at runtime (see deferred_config).
+        for c in cs.iter().filter(|c| !component(&s, c).deferred) {
             init.push(
                 // key: component id and value: style of initialization
                 ArgsKV::new_key(
@@ -147,6 +149,60 @@ fn sched_config(s: &SystemState, id: &ComponentId, cfg: &mut CompConfigState) {
         "execute".to_string(),
         sched_config_clients(&s, &id),
     ));
+}
+
+// The deferred components (that are not created at boot), as
+// `id = name` entries:
+//
+// - "deferred": those we are responsible for as their constructor,
+//   capmgr, or scheduler. The constructor creates them at boot without
+//   starting them, the scheduler starts and stops them, and the capmgr
+//   performs those operations on behalf of their scheduler.
+// - "loadable": those we can start and stop through our dependency on
+//   a `loader` interface (i.e. on their scheduler), so that we can
+//   find their ids by name.
+fn deferred_entries<F>(s: &SystemState, include: F) -> Vec<ArgsKV>
+where
+    F: Fn(&ComponentId) -> bool,
+{
+    s.get_named()
+        .ids()
+        .iter()
+        .filter(|(c, _)| component(&s, c).deferred && include(c))
+        .map(|(c, name)| ArgsKV::new_key(c.to_string(), name.var_name.clone()))
+        .collect()
+}
+
+fn deferred_config(s: &SystemState, id: &ComponentId, cfg: &mut CompConfigState) {
+    let props: &dyn PropertiesPass = s.get_properties();
+    let rmap = s.get_named().rmap();
+    // depending on either capmgr or capmgr_create makes a capmgr manage us
+    let capmgr_of = |c: &ComponentId| {
+        deps(&s, c)
+            .iter()
+            .find(|d| d.interface == "capmgr" || d.interface == "capmgr_create")
+            .map(|d| *rmap.get(&d.server).unwrap())
+    };
+    let managed = deferred_entries(&s, |c| {
+        props.service_dependency(c, ServiceType::Scheduler) == Some(*id)
+            || capmgr_of(c) == Some(*id)
+            || props.service_dependency(c, ServiceType::Constructor) == Some(*id)
+    });
+    let loaders: Vec<ComponentId> = deps(&s, &id)
+        .iter()
+        .filter(|d| d.interface == "loader")
+        .map(|d| *rmap.get(&d.server).unwrap())
+        .collect();
+    let loadable = deferred_entries(&s, |c| {
+        props
+            .service_dependency(c, ServiceType::Scheduler)
+            .map_or(false, |sched| loaders.contains(&sched))
+    });
+
+    cfg.args
+        .push(ArgsKV::new_arr("deferred".to_string(), managed));
+    cfg.args
+        .push(ArgsKV::new_arr("loadable".to_string(), loadable));
 }
 
 fn cap2kvarg(capid: u32, cap: &CapRes) -> ArgsKV {
@@ -330,6 +386,7 @@ impl Transition for ResAssignPass {
             capmgr_config(&s, &k, &mut cfg);
             constructor_config(&s, &k, &mut cfg);
             sched_config(&s, &k, &mut cfg);
+            deferred_config(&s, &k, &mut cfg);
             comp_config(&s, &k, &mut cfg);
             res.insert(k.clone(), comp_config_finalize(&s, &k, cfg));
         }
