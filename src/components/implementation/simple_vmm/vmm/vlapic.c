@@ -349,7 +349,8 @@ static void vlapic_accept_intr(struct acrn_vlapic *vlapic, uint32_t vector, bool
 	if ((lapic->svr.v & APIC_SVR_ENABLE) == 0U) {
 		/*
 		 * A software-disabled local APIC does not accept interrupts (SDM
-		 * Vol.3 11.4.7.2); drop it like hardware does. Reading the svr of
+		 * Vol.3, "Local APIC State After It Has Been Software Disabled");
+		 * drop it like hardware does. Reading the svr of
 		 * another vCPU's page is a benign race: it is a plain read.
 		 */
 		VMRT_DEBUG("vlapic %u is software disabled, ignoring interrupt %u\n", vlapic2vcpu(vlapic)->cpuid, vector);
@@ -649,7 +650,8 @@ static void vlapic_deliver_ipi(struct acrn_vlapic *src, struct vmrt_vm_vcpu *tar
 		/*
 		 * "INIT level de-assert" (level-triggered INIT without the assert
 		 * bit) is only a synchronization message for the arbitration IDs of
-		 * old APICs; it has no effect on the target (SDM Vol.3, "Interrupt Command Register").
+		 * old APICs; it has no effect on the target (SDM Vol.3, "Interrupt
+		 * Command Register").
 		 */
 		if ((icr_low & APIC_TRIGMOD_MASK) == APIC_TRIGMOD_LEVEL
 		    && (icr_low & APIC_LEVEL_MASK) == APIC_LEVEL_DEASSERT) {
@@ -672,10 +674,11 @@ static void vlapic_deliver_ipi(struct acrn_vlapic *src, struct vmrt_vm_vcpu *tar
 }
 
 /*
- * The guest wrote ICR low: send an IPI (SDM Vol.3, "Interrupt Command Register"). With APIC-register
- * virtualization the write has already landed in the virtual-APIC page and
- * this is the trap-like APIC-write VM exit that follows it (SDM Vol.3
- * 30.4.3.3); ICR high was written (and also trapped) before it.
+ * The guest wrote ICR low: send an IPI (SDM Vol.3, "Interrupt Command
+ * Register"). With APIC-register virtualization the write has already landed
+ * in the virtual-APIC page and this is the trap-like APIC-write VM exit that
+ * follows it (SDM Vol.3, "APIC-Write Emulation"); ICR high was written (and
+ * also trapped) before it.
  */
 static void vlapic_write_icrlo(struct acrn_vlapic *vlapic)
 {

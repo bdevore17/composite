@@ -188,3 +188,21 @@ vmrt_vm_exception_handler(struct vmrt_vm_vcpu *vcpu)
 - VM_EXIT_REASON_XSETBV
 
 	When guest uses xsetbv, this will be triggered.
+## Multiple vCPUs
+
+- `vmrt_vm_vcpu_init()` and `vmrt_vm_vcpu_start()` must run on the core the
+  vCPU will run on: the kernel binds the vCPU thread and its VMCS to the core
+  that creates it. vCPU 0 is created ready to start; every other vCPU starts in
+  `VMRT_VCPU_WAIT_SIPI`.
+- `vmrt_vcpu_init_ipi()` / `vmrt_vcpu_sipi()` are called by the VMM's local
+  APIC emulation when the guest sends INIT / STARTUP IPIs;
+  `vmrt_vcpu_wait_sipi_and_start()`, run on the AP's core, starts the vCPU at
+  the SIPI vector (the kernel takes CS/RIP from the `init_*` fields of
+  `struct vm_vcpu_shared_region` on the first VM entry).
+- `vmrt_vcpu_post_intr(vcpu, vector)` requests an interrupt on any vCPU from
+  any thread on any core. The vCPU's own exception handler moves pending
+  requests into its virtual-APIC page before every VM entry
+  (`vmrt_vcpu_sync_intr()`); nothing else may write a running vCPU's
+  virtual-APIC page.
+- `struct vmrt_spinlock` / `vmrt_spin_lock()` protect VMM state shared
+  between vCPU handlers; `vm->dev_lock` serializes device emulation.
