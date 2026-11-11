@@ -74,6 +74,13 @@ int COS_STUB_DECL(capmgr_thd_release)(thdid_t tid);
 int capmgr_rcv_release(thdid_t tid);
 int COS_STUB_DECL(capmgr_rcv_release)(thdid_t tid);
 
+/*
+ * Component recovery: the number of times component `id` was reset
+ * after a fault, -ECOMPRESET if it faulted and could not be recovered
+ * (it remains unavailable), or -EINVAL if it isn't recoverable.
+ */
+int capmgr_comp_resets(compid_t id);
+
 asndcap_t capmgr_asnd_create(spdid_t child, thdid_t t);
 asndcap_t COS_STUB_DECL(capmgr_asnd_create)(spdid_t child, thdid_t t);
 

@@ -57,6 +57,19 @@ struct cm_comp {
 
 	struct cm_tcap_pool tcap_pool[NUM_CPU];
 	struct mm_runlist   va_free; /* freed virtual address ranges of this component, see mm_va_get */
+
+	/*
+	 * Component recovery (see doc.md). The component got resources
+	 * that a reset can't reclaim (they are never cleared): memory
+	 * other than heap pages, rcv end-points, threads other than its
+	 * initialization threads.
+	 */
+	int unrecoverable_mem, unrecoverable_rcv, unrecoverable_thd;
+	struct {
+		int           registered; /* faults in the component are recoverable */
+		int           failed;     /* recovery was refused: it remains suspended */
+		unsigned long resets;
+	} recovery;
 };
 
 struct cm_thd {
@@ -214,6 +227,7 @@ cm_rcv_alloc_in(struct cm_comp *cm, struct crt_rcv *sched, thdclosure_index_t cl
 		assert(0);
 		ERR_THROW(NULL, done);
 	}
+	cm->unrecoverable_rcv = 1;
 	r->aliased_cap = res.rcv;
 	r->aliased_thd = res.thd;
 	r->aliased_tc  = res.tc;
@@ -281,6 +295,8 @@ cm_thd_alloc_in(struct cm_comp *c, struct cm_comp *sched, thdclosure_index_t clo
 	t->aliased_cap = res.cap;
 	t->client      = c;
 	t->core        = cos_cpuid();
+	/* Threads that execute the component's initialization (closure 0) exit after it */
+	if (closure_id != 0) c->unrecoverable_thd = 1;
 	/* FIXME: should take a reference to the scheduler */
 	/* Activate last: capmgr_thd_release finds threads in the slab */
 	ss_thd_activate(t);
@@ -842,6 +858,7 @@ contigmem_alloc(unsigned long npages)
 	if (!c) return 0;
 
 	ps_lock_take(&mm_lock);
+	c->unrecoverable_mem = 1;
 	page = contig_phy_pages;
 	if (crt_page_aliasn_aligned_in(page, PAGE_SIZE, npages, &cm_self()->comp, &c->comp, &vaddr)) BUG();
 	contigmem_pages_track(c, page, vaddr, npages);
@@ -868,6 +885,7 @@ contigmem_shared_alloc_aligned_flags(unsigned long npages, unsigned long align, 
 	if (!c) return 0;
 
 	ps_lock_take(&mm_lock);
+	c->unrecoverable_mem = 1;
 	s = ss_span_alloc();
 	if (!s) ERR_THROW(0, done);
 
@@ -994,6 +1012,8 @@ memmgr_map_phys_to_virt(paddr_t paddr, size_t size)
 	c = ss_comp_get(cos_inv_token());
 	if (!c) return 0;
 
+	c->unrecoverable_mem = 1;
+
 	return (vaddr_t)cos_hw_map(&c->comp.comp_res->ci, BOOT_CAPTBL_SELF_INITHW_BASE, paddr, size);
 }
 
@@ -1010,6 +1030,7 @@ memmgr_shared_page_allocn_aligned(unsigned long num_pages, unsigned long align, 
 	if (!c) return 0;
 
 	ps_lock_take(&mm_lock);
+	c->unrecoverable_mem = 1;
 	s = ss_span_alloc();
 	if (!s) ERR_THROW(0, done);
 	p = mm_pages_alloc(c, num_pages, align, 0);
@@ -1074,6 +1095,7 @@ mm_span_map(struct mm_span *s, struct cm_comp *c, unsigned long align)
 
 	addr = mm_map_pages(c, NULL, p, s->n_pages, align);
 	if (!addr) return 0;
+	c->unrecoverable_mem = 1;
 
 	for (i = 0; p; p = mm_span_page_next(p), i++) {
 		m = &p->mappings[slot];
@@ -1644,6 +1666,7 @@ capmgr_shared_kernel_page_create(vaddr_t *resource)
 {
 	struct cm_comp *c = ss_comp_get(cos_inv_token());
 	assert(c);
+	c->unrecoverable_mem = 1;
 
 	return crt_comp_shared_kernel_page_alloc(&c->comp, resource);
 }
@@ -1724,6 +1747,269 @@ asndcap_t capmgr_asnd_create(spdid_t child, thdid_t t) { BUG(); return 0; }
 asndcap_t capmgr_asnd_rcv_create(arcvcap_t rcv) { BUG(); return 0; }
 asndcap_t capmgr_asnd_key_create(cos_channelkey_t key) { BUG(); return 0; }
 
+/***
+ * Component recovery ("micro-reboot", see doc.md, and the kernel's
+ * recovery.h for the mechanisms).
+ *
+ * We register the components we manage that can be reset with the
+ * kernel: when a thread faults in one of them (in a synchronous
+ * invocation), the kernel suspends it (its invocations fail with
+ * -ECOMPRESET) and redirects the thread to cm_comp_fault (through
+ * recovery_entry.S). We then stop all execution in the component,
+ * reset it (heap memory, image), re-run its initialization, and
+ * resume it. The faulting thread, and all threads that were executing
+ * in the component, return -ECOMPRESET to their callers.
+ */
+
+/* The fault handler's stacks, one per component (see recovery_entry.S) */
+char cm_recovery_stacks[MAX_NUM_COMPS + 1][COS_STACK_SZ] __attribute__((aligned(COS_STACK_SZ)));
+void cm_recovery_entry(void);
+
+/* How many times we try to re-initialize a component, if its initialization faults */
+#define CM_RECOVERY_INIT_TRIES 3
+/*
+ * How long we wait for the threads executing in other components on
+ * behalf of the component (its invocations) to return to it, which
+ * unwinds them. Threads blocked there for longer (e.g. waiting for an
+ * event that only the failed component would have triggered) prevent
+ * the recovery.
+ */
+#define CM_RECOVERY_DRAIN_USEC 100000
+
+static unsigned long cm_cycs_per_usec;
+
+static int
+cm_recovery_verbose(unsigned long n)
+{
+	return n <= 3 || n % 100 == 0;
+}
+
+/*
+ * Release all of c's heap pages (as memmgr_heap_page_freen would).
+ * The pages are freed by runs of contiguous addresses and frames, so
+ * that the component's next allocations (of the same sizes) can reuse
+ * them. Returns the number of pages.
+ */
+static unsigned long
+mm_heap_release_all(struct cm_comp *c)
+{
+	unsigned long   b, n = 0;
+	unsigned int   *id;
+	struct mm_page *p;
+	u64_t           ts;
+
+	ps_lock_take(&mm_lock);
+	/* Unmap all pages first, for a single TLB shootdown */
+	for (b = 0; b < MM_HASH_SZ; b++) {
+		for (id = &mm_heap_hash[b]; *id; id = &p->hnext) {
+			p = ss_page_get(*id);
+			assert(p);
+			if (mm_mapping_comp(&p->mappings[0]) != c) continue;
+			if (mm_unmap(c, p->mappings[0].addr)) BUG();
+			n++;
+		}
+	}
+	if (n == 0) goto done;
+	ts = mm_shootdown();
+
+	for (b = 0; b < MM_HASH_SZ; b++) {
+again:
+		for (id = &mm_heap_hash[b]; *id; id = &p->hnext) {
+			struct mm_page *q;
+			unsigned long   npages;
+			vaddr_t         start;
+			char           *frames;
+
+			p = ss_page_get(*id);
+			if (mm_mapping_comp(&p->mappings[0]) != c) continue;
+			/* Only free from the first page of a run */
+			start  = p->mappings[0].addr;
+			frames = p->page;
+			q      = mm_heap_lookup(c, start - PAGE_SIZE, 0);
+			if (q && (char *)q->page == frames - PAGE_SIZE) continue;
+
+			for (npages = 0; (q = mm_heap_lookup(c, start + npages * PAGE_SIZE, 0))
+			                 && (char *)q->page == frames + npages * PAGE_SIZE;
+			     npages++) {
+				p = mm_heap_lookup(c, start + npages * PAGE_SIZE, 1);
+				assert(p == q);
+				ss_state_free(&p->mappings[0].comp);
+				mm_page_meta_free(p);
+			}
+			mm_frames_put(frames, npages, ts);
+			mm_va_put(c, start, npages, ts);
+			mm_stats.freed += npages;
+			/* The bucket changed */
+			goto again;
+		}
+	}
+done:
+	ps_lock_release(&mm_lock);
+
+	return n;
+}
+
+/*
+ * Stop all execution in c (which the kernel suspended): no core
+ * executes in it anymore once all cores processed a quiescence
+ * request. Then wait for the threads that execute in other components
+ * on behalf of c to return to it. Returns the number of threads
+ * still doing so (0 on success).
+ */
+static int
+cm_comp_quiesce(struct cm_comp *c)
+{
+	compcap_t cc    = cos_compinfo_get(c->comp.comp_res)->comp_cap;
+	u64_t     start = ps_tsc();
+	int       req, n;
+
+	do {
+		req = cos_comp_recovery_quiesce(cc);
+		assert(req > 0);
+		while ((n = cos_comp_recovery_quiescent(cc, req)) == -EAGAIN) ;
+		assert(n >= 0);
+	} while (n > 0 && ps_tsc() - start < (u64_t)CM_RECOVERY_DRAIN_USEC * cm_cycs_per_usec);
+
+	return n;
+}
+
+/* Reset c, and re-run its initialization. Returns 0 on success, or the reason of the failure. */
+static const char *
+cm_comp_reset(struct cm_comp *c)
+{
+	compcap_t cc = cos_compinfo_get(c->comp.comp_res)->comp_cap;
+	int       tries, ret = 0;
+
+	if (c->unrecoverable_mem) return "it has shared or device memory";
+	if (c->unrecoverable_rcv) return "it has rcv end-points";
+	if (c->unrecoverable_thd) return "it has threads";
+	if (cm_comp_quiesce(c)) return "threads executing on its behalf did not return to it";
+
+	for (tries = 0; tries < CM_RECOVERY_INIT_TRIES; tries++) {
+		/* No thread executes in c: reset its memory, and initialize it again */
+		mm_heap_release_all(c);
+		if (addr_get(c->comp.id, ADDR_IMAGE_RESET)) return "its image could not be reset";
+		ret = (int)cos_comp_upcall(cc, COS_UPCALL_RECOVER_INIT, 0, 0, 0);
+		if (ret == 0) return NULL;
+		printc("capmgr: re-initialization of component %lu failed (%d).\n", c->comp.id, ret);
+	}
+
+	return "its re-initialization failed";
+}
+
+/*
+ * The fault handler: the kernel redirected a thread that faulted in
+ * component cos_inv_token() here (see recovery_entry.S). This executes
+ * on that thread, while the component is suspended.
+ */
+long
+cm_comp_fault(word_t type, vaddr_t addr, vaddr_t ip, word_t tid)
+{
+	compid_t        id = (compid_t)cos_inv_token();
+	struct cm_comp *c  = ss_comp_get(id);
+	const char     *err;
+	unsigned long   n;
+	u64_t           start;
+
+	assert(c && c->recovery.registered && !c->recovery.failed);
+	n     = c->recovery.resets + 1;
+	start = ps_tsc();
+	if (cm_recovery_verbose(n)) {
+		printc("capmgr: component %lu faulted (fault %lu, thread %lu, ip 0x%lx, address 0x%lx), resetting it (#%lu).\n",
+		       id, type, tid, ip, addr, n);
+	}
+
+	err = cm_comp_reset(c);
+	if (err) {
+		/* Leave it suspended: its invocations keep failing with -ECOMPRESET */
+		c->recovery.failed = 1;
+		printc("capmgr: component %lu can't be recovered (%s), it remains unavailable.\n", id, err);
+
+		return -ECOMPRESET;
+	}
+	c->recovery.resets = n;
+	if (cm_recovery_verbose(n)) {
+		printc("capmgr: component %lu recovered in %llu usec.\n", id,
+		       (unsigned long long)((ps_tsc() - start) / cm_cycs_per_usec));
+	}
+
+	/*
+	 * Resume the component, and return from this invocation, at
+	 * once: this component's handler stack must not be in use when
+	 * the component can fault again. The thread then returns
+	 * -ECOMPRESET to its caller.
+	 */
+	cos_comp_recovery_resume(cos_compinfo_get(c->comp.comp_res)->comp_cap, -ECOMPRESET);
+	BUG();
+
+	return -ECOMPRESET;
+}
+
+int
+capmgr_comp_resets(compid_t id)
+{
+	struct cm_comp *c = ss_comp_get(id);
+
+	if (!c || !c->recovery.registered) return -EINVAL;
+	if (c->recovery.failed) return -ECOMPRESET;
+
+	return (int)c->recovery.resets;
+}
+
+/*
+ * Register the components that can be reset with the kernel: not
+ * schedulers (they have threads and rcv end-points), components in
+ * shared address spaces, nor components that execute after their
+ * initialization (main, or parallel_main), or that have a parallel
+ * initialization (asking them, with an upcall that doesn't touch
+ * their state).
+ */
+static void
+cm_recovery_init(void)
+{
+	struct cos_compinfo *ci = cos_compinfo_get(cos_defcompinfo_curr_get());
+	struct initargs      entries, curr;
+	struct initargs_iter i;
+	int                  cont, ret;
+	compid_t             id;
+
+	cm_cycs_per_usec = cos_hw_cycles_per_usec(BOOT_CAPTBL_SELF_INITHW_BASE);
+	assert(cm_cycs_per_usec > 0);
+
+	for (id = 1; id <= MAX_NUM_COMPS; id++) {
+		struct cm_comp *c = ss_comp_get(id);
+		compcap_t       cc;
+		sinvcap_t       handler;
+		word_t          flags;
+		int             excluded = 0;
+
+		if (!c || id == cos_compid()) continue;
+		ret = args_get_entry("execute", &entries);
+		assert(!ret);
+		for (cont = args_iter(&entries, &i, &curr); cont; cont = args_iter_next(&i, &curr)) {
+			int keylen;
+
+			if ((compid_t)atoi(args_key(&curr, &keylen)) == id && !strcmp(args_value(&curr), "sched")) excluded = 1;
+		}
+		ret = args_get_entry("addrspc_shared", &entries);
+		assert(!ret);
+		for (cont = args_iter(&entries, &i, &curr); cont; cont = args_iter_next(&i, &curr)) {
+			if ((compid_t)atoi(args_value(&curr)) == id) excluded = 1;
+		}
+		if (excluded) continue;
+
+		cc    = cos_compinfo_get(c->comp.comp_res)->comp_cap;
+		flags = cos_comp_upcall(cc, COS_UPCALL_RECOVER_QUERY, 0, 0, 0);
+		if (flags != COS_RECOVERY_CAPABLE) continue;
+
+		handler = cos_sinv_alloc(ci, BOOT_CAPTBL_SELF_COMP, (vaddr_t)cm_recovery_entry, id);
+		assert(handler);
+		if (cos_comp_recovery_register(ci, cc, handler)) BUG();
+		c->recovery.registered = 1;
+		printc("Capmgr: component %lu is recoverable.\n", id);
+	}
+}
+
 void capmgr_create_noop(void) { return; }
 
 void
@@ -1778,6 +2064,9 @@ cos_init(void)
 	cos_kmem_reclaim_init(ci, &cm_kmem_reclaim);
 	/* Initialize the other component's for which we're responsible */
 	capmgr_comp_init();
+
+	/* The components that we can reset if they fault */
+	cm_recovery_init();
 
 	/* Reserve some continuous pages */
 	contig_phy_pages = crt_page_allocn(&cm_self()->comp, CONTIG_PHY_PAGES);

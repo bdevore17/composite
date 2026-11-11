@@ -508,6 +508,29 @@ chkpt_comp_init(struct crt_comp *comp, struct crt_chkpt *chkpt, char *name)
 
 }
 
+/* Component recovery: see ADDR_IMAGE_RESET */
+static int
+addr_image_reset(compid_t id)
+{
+	struct crt_comp *target;
+	unsigned int i;
+	int ret;
+
+	target = boot_comp_get(id);
+	if (!target || !target->refcnt) return -EINVAL;
+
+	ret = crt_comp_image_reset(target);
+	if (ret) return ret;
+	/* The image reset the user-level capabilities of the component's invocations */
+	for (i = 1; i <= BOOTER_MAX_SINV; i++) {
+		struct crt_sinv *s = ss_sinv_get(i);
+
+		if (s && s->client == target) crt_sinv_ucap_restore(s);
+	}
+
+	return 0;
+}
+
 unsigned long
 addr_get(compid_t id, addr_t type)
 {
@@ -527,6 +550,8 @@ addr_get(compid_t id, addr_t type)
 	ci = cos_compinfo_get(target->comp_res);
 
 	switch (type) {
+	case ADDR_IMAGE_RESET:
+		return (unsigned long)addr_image_reset(id);
 	case ADDR_CAPTBL_FRONTIER:
 		return ci->cap_frontier;
 	case ADDR_HEAP_FRONTIER:

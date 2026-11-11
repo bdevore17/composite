@@ -40,6 +40,51 @@ Run descriptors (`MM_NRUNS`) and the reclamation rings are statically sized; if 
 `contigmem_alloc` memory and memory mapped into VMs with `memmgr_shared_page_map_aligned_in_vm` (no unmap for VMs) are not reclaimed.
 The capmgr's locks are spinlocks (see the warning in the code).
 
+### Component recovery ("micro-reboot")
+
+When a thread faults in a component that the capmgr can reset (the *server*, S), the system keeps running: S is reset to its initial state and re-initialized, and the invocations of S that were in progress return `-ECOMPRESET` to their callers.
+The kernel mechanisms are described in `src/kernel/include/recovery.h`; the capmgr's part is in `capmgr.c` (`cm_recovery_init`, `cm_comp_fault`) and `recovery_entry.S`.
+
+**Which components.**
+At initialization, the capmgr registers with the kernel (`cos_comp_recovery_register`) the components it manages that are *passive servers*: not schedulers, not in a shared address space (user-level invocations), and without `main`, `parallel_main`, or `cos_parallel_init` (it asks each component with the `COS_UPCALL_RECOVER_QUERY` upcall, which touches no state).
+A passive server only executes in the invocations of its clients (and, once, in its `cos_init`).
+Faults in other components stop the system, as before.
+
+**Fault.**
+A fault in S, in an invocation (not in a thread's own component), makes the kernel *suspend* S: invocations of S fail with `-ECOMPRESET` from now on, and no thread can return into S.
+The faulting thread is redirected to `cm_comp_fault`, as an invocation of the capmgr made by S, on a stack reserved for S (`cm_recovery_stacks`): S's re-initialization runs on this thread, and can invoke the capmgr (e.g. the memmgr) on the thread's normal stack.
+The recovery thus executes on the faulting thread, at its priority.
+
+**Reset.**
+`cm_comp_fault`:
+
+1. Refuses to reset S if it got resources that a reset can't reclaim: memory other than heap pages (shared memory, contiguous or device memory, shared kernel pages), rcv end-points, or threads other than its initialization threads (closure 0).
+    These are recorded when they are given to S, and never cleared.
+2. Stops all execution in S (`cos_comp_recovery_quiesce`/`_quiescent`): each core unwinds its current thread if it executes in S, and counts the threads that execute in other components on behalf of S (invocations that S made, e.g. a thread blocked in the scheduler).
+    Those are unwound when they return to S, so the capmgr waits for them (up to `CM_RECOVERY_DRAIN_USEC`), and refuses the reset if some never return: they could wait for an event that only S would have triggered.
+3. Releases all of S's heap pages (`mm_heap_release_all`, as `memmgr_heap_page_freen`, by runs of contiguous pages so that they are reused for the same allocations).
+4. Has the booter reset S's writable memory (data and bss, which include the static stacks) from S's ELF image, and restore the user-level capabilities of S's invocations, which live in its data (`addr_get(id, ADDR_IMAGE_RESET)`, `crt_comp_image_reset`).
+5. Re-runs S's initialization (`COS_UPCALL_RECOVER_INIT`, `cos_comp_upcall`): the libc initialization and constructors, then `cos_init`, on the faulting thread.
+    If it faults, steps 3-5 are retried (up to `CM_RECOVERY_INIT_TRIES` times).
+6. Resumes S and returns from the fault handler in one kernel operation (`cos_comp_recovery_resume`), so that S's handler stack is free before S can fault again.
+    The faulting thread returns `-ECOMPRESET` to the caller of the invocation that faulted.
+
+When the reset is refused, S stays suspended forever: its invocations fail with `-ECOMPRESET`, and the rest of the system keeps running.
+`capmgr_comp_resets(id)` reports the number of resets of a component (or `-ECOMPRESET` once it failed).
+A reset takes 10-40 ms in QEMU without KVM (most of it releasing, re-mapping, and zeroing the server's heap).
+
+**Invocations during a reset** fail fast with `-ECOMPRESET` (the kernel cannot block them).
+The client can retry (`COS_INV_RETRY` in `cos_recovery.h`); note that a client that retries with a higher priority than the recovering thread, on the same core, delays the recovery.
+
+**What is not reset, and limits.**
+
+- The initialization threads of S, created at boot by its scheduler, exited after initialization (they are blocked in the scheduler, and never run again); they stay allocated, and can't run in the new S (the kernel refuses to switch to a thread whose own component was reset).
+    Recovery creates no thread, capability, or kernel memory, so repeated recoveries leak nothing (tested with hundreds of resets).
+- The scheduler's state about S (its initialization state) is unchanged: S is not re-initialized through the `init` interface, and its `init_done` is not called again.
+- State that S's clients or servers keep about S (e.g. resources that S allocated in other components, such as locks in the scheduler) is not reclaimed.
+- Schedulers, capmgrs, the booter, components in shared address spaces, and components with a `main` (they have threads of their own) can't be recovered.
+- Only one capmgr is supported, as for the other capmgr features.
+
 ### Component teardown (not implemented)
 
 Tearing down a component (e.g. `capmgr_comp_terminate(compid)`, for crash recovery or unloading) is not implemented.

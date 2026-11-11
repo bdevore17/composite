@@ -20,3 +20,12 @@ Any component that implements this, should also implement `capmgr_create` that e
     The caller is responsible for the thread not being in use: e.g. a scheduler first removes it from its run-queues (see `sched_thd_delete`).
 - They return `0` on success, `-EINVAL` for an unknown thread or the wrong core, `-EPERM` if the caller doesn't hold the thread, `-EBUSY` for the calling thread, or an error from the kernel.
 - Threads created at boot (the components' initial and scheduler threads) cannot be released.
+
+### Component recovery
+
+The capmgr resets components that fault, when it can (see the `capmgr.simple` documentation).
+`capmgr_comp_resets(id)` returns how many times component `id` was reset, `-ECOMPRESET` if it faulted and could not be recovered (it remains unavailable: its invocations fail with `-ECOMPRESET`), or `-EINVAL` if it isn't recoverable (a fault in it stops the system).
+
+Clients of a recoverable component see `-ECOMPRESET` (`cos_errno.h`) as the return value of the invocations that were executing in it when it faulted, and of the invocations made while it is being reset.
+The component's state was lost: it restarted from its initial state.
+`cos_recovery.h` (component library) has `cos_inv_reset(ret)` and `COS_INV_RETRY(tries, call)` to detect the error and retry.
