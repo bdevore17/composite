@@ -5,6 +5,7 @@
 #include "devices/vrtc/vrtc.h"
 #include "devices/vps2/vps2.h"
 #include "devices/vpci/virtio_net_io.h"
+#include "devices/vpci/virtio_blk.h"
 
 
 /*
@@ -154,6 +155,11 @@ io_handler(struct vmrt_vm_vcpu *vcpu)
 	case VPCI_CONFIG_DATA3:
 	case VPCI_MECHANISM_CONTROL_REG:
 		vpci_handler(port_id, access_dir, access_sz, vcpu);
+		goto done;
+	}
+
+	if (virtio_blk_handles_port(port_id)) {
+		virtio_blk_handler(port_id, access_dir, access_sz, vcpu);
 		goto done;
 	}
 

@@ -2,8 +2,8 @@
 #include <cos_debug.h>
 #include "vpci.h"
 
-/* Only two are supported: one bridge pci and one virtio-net pci */
-#define MAX_VPCI_NUM 2
+/* Bus 0 only: device 0 is the host bridge, then virtio-net, then virtio-blk */
+#define MAX_VPCI_NUM 3
 
 #define PCI_HOST_BRIDGE_VENDOR		0x8086
 #define PCI_HOST_BRIDGE_DEV		0x29C0
@@ -53,10 +53,22 @@ struct vpci_config_type1 vpci_host_bridge = {
 	.bridge_control = 0
 };
 
-void
+/* Register a device as the next device number on bus 0; returns its live config space */
+struct vpci_config_space *
 vpci_regist(struct vpci_config_space *vpci, u32_t sz)
 {
-	memcpy(&vpci_devs[free_dev++], vpci, sz);
+	assert(free_dev < MAX_VPCI_NUM);
+	assert(sz <= sizeof(struct vpci_config_space));
+	memcpy(&vpci_devs[free_dev], vpci, sz);
+
+	return &vpci_devs[free_dev++];
+}
+
+/* Is there a device at this bus/device/function? (single-function devices on bus 0 only) */
+static inline int
+vpci_present(struct vpci_bdf *vbdf)
+{
+	return vbdf->bus_num == 0 && vbdf->func_num == 0 && vbdf->dev_num < free_dev;
 }
 
 void
@@ -233,10 +245,11 @@ set_vpci_dev_reg(u8_t* raw_data, u8_t reg, u32_t val, u8_t sz)
 		assert(0);
 		break;
 	case OFFSET_INTERRUPT_LINE:
-		assert(0);
+		/* Read/write scratch register for software (PCI 3.0, 6.2.4) */
+		*raw_data = (u8_t)val;
 		break;
 	case OFFSET_INTERRUPT_PIN:
-		assert(0);
+		/* Read-only; ignore like hardware does */
 		break;
 	case OFFSET_MIN_GRANT:
 		assert(0);
@@ -262,8 +275,8 @@ set_vpci_reg(u32_t bdf, u32_t val, u8_t idx, u8_t sz)
 
 	memcpy(&vbdf, &bdf, sizeof(vbdf));
 
-	index = vbdf.bus_num + vbdf.dev_num;
-	if (vbdf.bus_num > 0 || vbdf.dev_num > 1) return;
+	if (!vpci_present(&vbdf)) return;
+	index = vbdf.dev_num;
 
 	vpci = &vpci_devs[index];
 
@@ -279,12 +292,10 @@ set_vpci_reg(u32_t bdf, u32_t val, u8_t idx, u8_t sz)
 		set_vpci_host_bridge_reg(raw_data, reg, val, sz);
 		break;
 
-	case 1:
+	default:
 		/* Process with device */
 		set_vpci_dev_reg(raw_data, reg, val, sz);
 		break;
-	default:
-		assert(0);
 	}
 }
 
@@ -296,9 +307,9 @@ get_vpci_reg(u32_t bdf)
 	u8_t index;
 
 	memcpy(&vbdf, &bdf, sizeof(vbdf));
-	index = vbdf.bus_num + vbdf.dev_num;
-
-	if (vbdf.bus_num > 0 || vbdf.dev_num > 1) return 0XFFFFFFFF;
+	/* Absent devices read as all-ones, which is how the guest finds nothing there */
+	if (!vpci_present(&vbdf)) return 0XFFFFFFFF;
+	index = vbdf.dev_num;
 
 	vpci = &vpci_devs[index];
 

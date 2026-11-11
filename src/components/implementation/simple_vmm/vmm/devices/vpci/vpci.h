@@ -177,4 +177,4 @@ struct vpci_bdf {
 };
 
 void vpci_handler(u16_t port, int dir, int sz, struct vmrt_vm_vcpu *vcpu);
-void vpci_regist(struct vpci_config_space *vpci, u32_t sz);
+struct vpci_config_space *vpci_regist(struct vpci_config_space *vpci, u32_t sz);

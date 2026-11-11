@@ -23,6 +23,7 @@
 #include <netshmem.h>
 #include <nic_netio_shmem.h>
 #include <devices/vpci/virtio_net_io.h>
+#include <devices/vpci/virtio_blk.h>
 
 
 /*
@@ -194,6 +195,7 @@ vm_comp_create(void)
 
 	ioapic_init(vm);
 	vm->dev_lock.locked = 0;
+	virtio_blk_init(vm);
 
 	printc("Guest(%s) image has been loaded into the VM component\n", vm->name);
 
