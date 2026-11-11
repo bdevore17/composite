@@ -89,8 +89,12 @@ thdid_t
 sched_thd_create_closure(thdclosure_index_t idx)
 {
 	sched_param_t p = 0;
-	struct slm_thd *t = thd_alloc_in(cos_inv_token(), idx, &p, 0);
+	struct slm_thd *t;
+	extern int loader_comp_executable(compid_t id);
 
+	/* A component started at runtime can't create threads while it is stopped */
+	if (!loader_comp_executable((compid_t)cos_inv_token())) return 0;
+	t = thd_alloc_in(cos_inv_token(), idx, &p, 0);
 	if (!t) return 0;
 	/* Remember the component the thread executes in, for sched_thd_delete */
 	ss_thd_get(t->tid)->resources.comp = (compid_t)cos_inv_token();
@@ -149,6 +153,63 @@ sched_thd_delete(thdid_t tid)
 	if (ret) printc("sched: capmgr could not release thread %lu (err %d)\n", (unsigned long)tid, ret);
 
 	return ret;
+}
+
+/* Record that thread t executes in component c, for sched_thd_delete and sched_comp_thds_delete. */
+void
+sched_thd_comp_set(struct slm_thd *t, compid_t c)
+{
+	ss_thd_get(t->tid)->resources.comp = c;
+}
+
+/*
+ * Delete all of the threads that execute in component c, when it is
+ * stopped (see loader_comp_stop): remove them from scheduling, and
+ * release them in the capmgr. All of them must be on this core, and
+ * have exited, or be blocked (in the scheduler, not on a block point).
+ * Threads that are runnable could have been preempted anywhere,
+ * including in another component's critical section. Otherwise
+ * nothing is changed, and -EINVAL (other core) or -EBUSY is
+ * returned. Returns the number of threads deleted.
+ */
+int
+sched_comp_thds_delete(compid_t c)
+{
+	static thdid_t tids[NUM_CPU][MAX_NUM_THREADS];
+	thdid_t *ts = tids[cos_cpuid()];
+	struct slm_thd *current = slm_thd_current();
+	struct slm_thd_container *tc;
+	int i, n = 0, ret = 0;
+
+	slm_cs_enter(current, SLM_CS_NONE);
+	for (i = 1; i <= MAX_NUM_THREADS; i++) {
+		tc = ss_thd_get(i);
+		if (!tc || tc->resources.comp != c) continue;
+		if (&tc->thd == current) ERR_THROW(-EBUSY, done);
+		if (tc->thd.cpuid != cos_cpuid()) ERR_THROW(-EINVAL, done);
+		if (tc->thd.state != SLM_THD_DYING && tc->thd.state != SLM_THD_BLOCKED) ERR_THROW(-EBUSY, done);
+		ts[n++] = tc->thd.tid;
+	}
+	for (i = 0; i < n; i++) {
+		struct slm_thd *t = &ss_thd_get(ts[i])->thd;
+
+		if (t->state != SLM_THD_DYING) slm_thd_deinit(t);
+	}
+done:
+	slm_cs_exit(NULL, SLM_CS_NONE);
+	if (ret) return ret;
+
+	for (i = 0; i < n; i++) {
+		/* Free our bookkeeping before the capmgr makes the tid reusable */
+		slm_thd_mem_free(ss_thd_get(ts[i]));
+		if ((ret = capmgr_thd_release(ts[i]))) {
+			printc("sched: capmgr could not release thread %lu of component %lu (err %d)\n",
+			       (unsigned long)ts[i], (unsigned long)c, ret);
+			BUG();
+		}
+	}
+
+	return n;
 }
 
 int

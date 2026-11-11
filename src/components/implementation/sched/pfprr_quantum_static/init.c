@@ -40,6 +40,8 @@
 #include <barrier.h>
 #include <init.h>
 #include <initargs.h>
+#include <capmgr.h>
+#include <loader.h>
 
 #include <crt.h>
 
@@ -63,9 +65,24 @@ struct schedinit_status {
 	schedinit_t status;
 	unsigned long init_core;
 	struct slm_thd *initialization_thds[NUM_CPU];
+	int runtime;		/* initialized at runtime (loader_comp_start), not at boot */
 };
 
 static struct schedinit_status initialization_state[MAX_NUM_COMPS] = { 0 };
+
+/*
+ * The components we start at runtime (`boot = "deferred"`), see
+ * loader_comp_start.
+ */
+typedef enum {
+	LOADER_NONE = 0,	/* not deferred: initialized at boot */
+	LOADER_STOPPED,
+	LOADER_STARTING,	/* loaded, executing its initialization */
+	LOADER_RUNNING,		/* initialized */
+	LOADER_STOPPING,
+} loader_state_t;
+
+static unsigned long loader_state[MAX_NUM_COMPS] = { 0 };
 
 static void
 component_initialize_next(compid_t cid)
@@ -112,6 +129,17 @@ calculate_initialization_schedule(void)
 		component_initialize_next(id);
 	}
 
+	/* The components we start at runtime are not in the initialization schedule */
+	if (args_get_entry("deferred", &exec_entries)) return;
+	for (cont = args_iter(&exec_entries, &i, &curr) ; cont ; cont = args_iter_next(&i, &curr)) {
+		int      keylen;
+		compid_t id = atoi(args_key(&curr, &keylen));
+
+		assert(id > 0 && id < MAX_NUM_COMPS);
+		loader_state[id] = LOADER_STOPPED;
+		printc("\tSched %ld: component %s (%ld) is started at runtime\n", cos_compid(), args_value(&curr), id);
+	}
+
 	return;
 }
 
@@ -121,8 +149,12 @@ static __attribute__((noreturn)) void
 exit_init_thd(void)
 {
 	struct slm_thd *current = slm_thd_current_extern();
+	compid_t client = (compid_t)cos_inv_token();
 
-	if (cos_coreid() == 0) printc("\tScheduler %ld: Exiting thread %ld from component %ld\n", cos_compid(), cos_thdid(), (compid_t)cos_inv_token());
+	/* Components started at runtime (loader_comp_start) can do this repeatedly: don't flood the console */
+	if (cos_coreid() == 0 && !initialization_state[client].runtime) {
+		printc("\tScheduler %ld: Exiting thread %ld from component %ld\n", cos_compid(), cos_thdid(), client);
+	}
 
 	slm_cs_enter(current, SLM_CS_NONE);
 	slm_thd_deinit(current);		/* I'm out! */
@@ -166,6 +198,13 @@ init_done(int parallel_init, init_main_t cont)
 	 */
 	if (s->status == SCHEDINIT_INITING) {
 		/*
+		 * A component started at runtime with neither
+		 * parallel initialization nor a main is done (the
+		 * component library expects init_done not to return).
+		 */
+		if (s->runtime && !parallel_init && cont == INIT_MAIN_NONE) exit_init_thd();
+
+		/*
 		 * Assumption: here we're moving on to parallel
 		 * initialization regardless if it is requested or
 		 * not. We *know* that we've created all parallel
@@ -175,6 +214,19 @@ init_done(int parallel_init, init_main_t cont)
 
 		/* Continue with parallel initialization... */
 		ps_store(&s->status, SCHEDINIT_PARINIT);
+
+		return;
+	}
+
+	/*
+	 * Components started at runtime only initialize on the core
+	 * that started them, and there is no system initialization to
+	 * wait for: continue with main, if any (see loader_comp_start).
+	 */
+	if (s->runtime) {
+		/* No main: done (loader_comp_start waits for the thread to exit) */
+		if (cont == INIT_MAIN_NONE) exit_init_thd();
+		ps_store(&s->status, SCHEDINIT_MAIN);
 
 		return;
 	}
@@ -286,4 +338,129 @@ void
 slm_idle_comp_initialization(void)
 {
 	slm_comp_init_loop();
+}
+
+/***
+ * Starting and stopping components at runtime (the `loader`
+ * interface).
+ *
+ * Components marked `boot = "deferred"` in the composition script
+ * have us as their scheduler (init server), but are not in our
+ * initialization schedule. The composer lists them in our initargs
+ * ("deferred"). Any component that depends on our `loader` interface
+ * can start and stop them.
+ *
+ * Starting one has the capmgr load it (its memory image is reset, and
+ * its clients' invocations to it are activated), then executes its
+ * initialization as at boot, but only on the current core: we create
+ * its initialization thread at the caller's priority, and wait for it
+ * to complete `cos_init` and `parallel_init` (`init_done`). Its
+ * `main`, if any, then executes in that thread (`parallel_main`
+ * executes on that core only).
+ *
+ * Stopping one deletes its threads (sched_comp_thds_delete), then has
+ * the capmgr deactivate the invocations to it, and release its
+ * memory.
+ */
+
+/* Can component id execute (have threads created in it)? */
+int
+loader_comp_executable(compid_t id)
+{
+	unsigned long state;
+
+	if (id <= 0 || id >= MAX_NUM_COMPS) return 1;
+	state = ps_load(&loader_state[id]);
+
+	return state == LOADER_NONE || state == LOADER_STARTING || state == LOADER_RUNNING;
+}
+
+/* Is id a component we start at runtime, and not the caller? */
+static int
+loader_comp_valid(compid_t id)
+{
+	if (id <= 0 || id >= MAX_NUM_COMPS || id == (compid_t)cos_inv_token()) return 0;
+
+	return ps_load(&loader_state[id]) != LOADER_NONE;
+}
+
+int
+loader_comp_start(compid_t id)
+{
+	extern struct slm_thd *thd_alloc_in(compid_t id, thdclosure_index_t idx, sched_param_t *parameters, int reschedule);
+	extern void sched_thd_comp_set(struct slm_thd *t, compid_t c);
+	extern int sched_thd_yield(void);
+	struct slm_thd *current = slm_thd_current_extern();
+	struct schedinit_status *s;
+	struct slm_thd *t;
+	sched_param_t param[2];
+	int ret;
+
+	if (!loader_comp_valid(id)) return -EINVAL;
+	if (!ps_cas(&loader_state[id], LOADER_STOPPED, LOADER_STARTING)) return -EBUSY;
+
+	/* Reset its image, and enable invocations to it */
+	if ((ret = capmgr_comp_start(id))) {
+		ps_store(&loader_state[id], LOADER_STOPPED);
+		return ret;
+	}
+
+	s = &initialization_state[id];
+	*s = (struct schedinit_status) {
+		.status    = SCHEDINIT_INITING,
+		.init_core = cos_coreid(),
+		.initialization_thds = { 0 },
+		.runtime   = 1,
+	};
+	simple_barrier_init(&s->barrier, 1);
+
+	/* Its initialization (and main) thread, at our priority */
+	param[0] = sched_param_pack(SCHEDP_PRIO, current->priority);
+	param[1] = 0;
+	t = thd_alloc_in(id, 0, param, 0);
+	if (!t) {
+		/* Undo the load: there are no threads to delete */
+		if (capmgr_comp_stop(id)) BUG();
+		*s = (struct schedinit_status) { 0 };
+		ps_store(&loader_state[id], LOADER_STOPPED);
+
+		return -ENOMEM;
+	}
+	sched_thd_comp_set(t, id);
+
+	/*
+	 * Let it run (at our priority) until it completes its
+	 * initialization: it starts executing its main, or it exits if
+	 * it has none.
+	 */
+	while (ps_load(&s->status) != SCHEDINIT_MAIN && t->state != SLM_THD_DYING) sched_thd_yield();
+	ps_store(&loader_state[id], LOADER_RUNNING);
+
+	return 0;
+}
+
+int
+loader_comp_stop(compid_t id)
+{
+	extern int sched_comp_thds_delete(compid_t c);
+	int ret;
+
+	if (!loader_comp_valid(id)) return -EINVAL;
+	if (!ps_cas(&loader_state[id], LOADER_RUNNING, LOADER_STOPPING)) return -EBUSY;
+
+	/* No more threads in it... */
+	ret = sched_comp_thds_delete(id);
+	if (ret < 0) {
+		ps_store(&loader_state[id], LOADER_RUNNING);
+		return ret;
+	}
+	/* ...then no more invocations of it, and its memory is released */
+	if ((ret = capmgr_comp_stop(id))) {
+		printc("Scheduler %ld: the capmgr could not stop component %ld (err %d).\n", cos_compid(), id, ret);
+		BUG();
+	}
+	initialization_state[id] = (struct schedinit_status) { 0 };
+	ps_store(&loader_state[id], LOADER_STOPPED);
+
+	return 0;
 }
