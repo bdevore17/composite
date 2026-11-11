@@ -18,6 +18,7 @@
 
 #include <init.h>
 #include <addr.h>
+#include <ps.h>
 
 #ifndef BOOTER_MAX_SINV
 #define BOOTER_MAX_SINV 1024
@@ -53,6 +54,27 @@
 static struct crt_comp boot_comps[MAX_NUM_COMPS];
 static const  compid_t sched_root_id  = 2;
 static        long     boot_id_offset = -1;
+
+/*
+ * Components started at runtime (`boot = "deferred"`): they are
+ * created at boot like all others, but the invocations to them are
+ * redirected to addr_comp_absent (in the booter) until the capmgr
+ * loads them (addr_comp_load).
+ */
+typedef enum {
+	BOOT_DEFERRED_NONE = 0,	/* not deferred: created and initialized at boot */
+	BOOT_DEFERRED_UNLOADED,
+	BOOT_DEFERRED_LOADED,
+} boot_deferred_t;
+static boot_deferred_t boot_deferred[MAX_NUM_COMPS + 1];
+/*
+ * The server stub for addr_comp_absent: the entry point of those
+ * invocations. It only exists if we export the addr interface, which
+ * is the case in all systems with a capmgr (thus with deferred
+ * components).
+ */
+extern void __cosrt_s_addr_comp_absent(void) __attribute__((weak));
+static struct ps_lock  boot_deferred_lock = PS_LOCK_INITIALIZER;
 
 SS_STATIC_SLAB(sinv,   struct crt_sinv,         BOOTER_MAX_SINV);
 SS_STATIC_SLAB(thd,    struct crt_thd,          BOOTER_MAX_INITTHD);
@@ -375,6 +397,21 @@ comps_init(void)
 	 * are reserved as is, so they can be allocated to regardless.
 	 */
 
+	/* Components that are started at runtime */
+	ret = args_get_entry("deferred", &comps);
+	for (cont = !ret && args_iter(&comps, &i, &curr) ; cont ; cont = args_iter_next(&i, &curr)) {
+		int      keylen;
+		compid_t id = atoi(args_key(&curr, &keylen));
+
+		assert(id > 0 && id <= MAX_NUM_COMPS && id != cos_compid());
+		if (!__cosrt_s_addr_comp_absent) {
+			printc("Error: deferred components require the booter to export the addr interface.\n");
+			BUG();
+		}
+		boot_deferred[id] = BOOT_DEFERRED_UNLOADED;
+		printc("Component %s (%lu) is deferred: it is started at runtime.\n", args_value(&curr), id);
+	}
+
 	/*
 	 * Create the synchronous invocations for the component. This
 	 * has to go *after* the updating of the capability frontier
@@ -400,9 +437,14 @@ comps_init(void)
 				strtoul(args_get_from("s_fn_addr", &curr), NULL, 10),
 				strtoul(args_get_from("s_altfn_addr", &curr), NULL, 10)
 		);
+		/* Invocations of a deferred server fail until it is loaded */
+		if (boot_deferred[serv_id] != BOOT_DEFERRED_NONE) {
+			if (crt_sinv_retarget(sinv, BOOT_CAPTBL_SELF_COMP, (vaddr_t)__cosrt_s_addr_comp_absent)) BUG();
+		}
 		ss_sinv_activate(sinv);
-		printc("\t%s (%lu->%lu):\tclient_fn @ 0x%lx, client_ucap @ 0x%lx, server_fn @ 0x%lx\n",
-		       sinv->name, sinv->client->id, sinv->server->id, sinv->c_fn_addr, sinv->c_ucap_addr, sinv->s_fn_addr);
+		printc("\t%s (%lu->%lu):\tclient_fn @ 0x%lx, client_ucap @ 0x%lx, server_fn @ 0x%lx%s\n",
+		       sinv->name, sinv->client->id, sinv->server->id, sinv->c_fn_addr, sinv->c_ucap_addr, sinv->s_fn_addr,
+		       boot_deferred[serv_id] != BOOT_DEFERRED_NONE ? " (deferred)" : "");
 	#ifdef ENABLE_CHKPT
 		assert(serv->n_sinvs < CRT_COMP_SINVS_LEN);
 		serv->sinvs[serv->n_sinvs] = *sinv;
@@ -534,6 +576,106 @@ addr_get(compid_t id, addr_t type)
 	default:
 		return 0;
 	}
+}
+
+/*
+ * The invocations of deferred components that aren't loaded execute
+ * this. It returns a full word so that -ENOENT is negative for
+ * functions returning either int or long.
+ */
+long
+addr_comp_absent(void)
+{
+	return -ENOENT;
+}
+
+/*
+ * Validate an addr_comp_(un)load call for component id. Returns the
+ * component, or NULL and the error in *err.
+ */
+static struct crt_comp *
+deferred_comp_get(compid_t id, int *err)
+{
+	compid_t client = (compid_t)cos_inv_token();
+	struct crt_comp *c;
+
+	*err = -EPERM;
+	if (client <= (compid_t)boot_id_offset || client > MAX_NUM_COMPS) return NULL;
+	c = boot_comp_get(client);
+	if (!(c->flags & CRT_COMP_CAPMGR)) return NULL;
+
+	*err = -EINVAL;
+	if (id <= (compid_t)boot_id_offset || id > MAX_NUM_COMPS || boot_deferred[id] == BOOT_DEFERRED_NONE) return NULL;
+
+	return boot_comp_get(id);
+}
+
+int
+addr_comp_load(compid_t id)
+{
+	struct crt_comp *c;
+	struct crt_sinv *s;
+	int i, ret;
+
+	c = deferred_comp_get(id, &ret);
+	if (!c) return ret;
+
+	ps_lock_take(&boot_deferred_lock);
+	if (boot_deferred[id] != BOOT_DEFERRED_UNLOADED) ERR_THROW(-EBUSY, done);
+
+	/*
+	 * The image from the elf object, then the ucaps of the
+	 * component's invocations to its servers, which are in its
+	 * image (they still reference the same, active, sinvs).
+	 */
+	if ((ret = crt_comp_image_reset(c))) goto done;
+	for (i = 1; i <= BOOTER_MAX_SINV; i++) {
+		s = ss_sinv_get(i);
+		if (s && s->client == c) crt_sinv_ucap_write(s, NULL);
+	}
+	/* Finally, allow the clients to invoke it */
+	for (i = 1; i <= BOOTER_MAX_SINV; i++) {
+		s = ss_sinv_get(i);
+		if (!s || s->server != c) continue;
+		if ((ret = crt_sinv_activate(s))) {
+			printc("Booter: could not activate sinv %s (%lu->%lu): %d\n", s->name, s->client->id, id, ret);
+			BUG();
+		}
+	}
+	boot_deferred[id] = BOOT_DEFERRED_LOADED;
+done:
+	ps_lock_release(&boot_deferred_lock);
+
+	return ret;
+}
+
+int
+addr_comp_unload(compid_t id)
+{
+	struct crt_comp *c;
+	struct crt_sinv *s;
+	int i, ret;
+
+	c = deferred_comp_get(id, &ret);
+	if (!c) return ret;
+
+	ps_lock_take(&boot_deferred_lock);
+	if (boot_deferred[id] != BOOT_DEFERRED_LOADED) ERR_THROW(-EBUSY, done);
+
+	for (i = 1; i <= BOOTER_MAX_SINV; i++) {
+		s = ss_sinv_get(i);
+		if (!s || s->server != c) continue;
+		if ((ret = crt_sinv_retarget(s, BOOT_CAPTBL_SELF_COMP, (vaddr_t)__cosrt_s_addr_comp_absent))) {
+			printc("Booter: could not deactivate sinv %s (%lu->%lu): %d\n", s->name, s->client->id, id, ret);
+			BUG();
+		}
+	}
+	boot_deferred[id] = BOOT_DEFERRED_UNLOADED;
+	ret = 0;
+done:
+	ps_lock_release(&boot_deferred_lock);
+
+	return ret;
 }
 
 static void
