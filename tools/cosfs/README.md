@@ -16,10 +16,22 @@ toolchain needed: `make -C tools/cosfs`.
   core, ramfs and cosfs (same scenarios as the in-Composite tests, plus
   a randomized differential test of ramfs against cosfs, leak checks,
   ENOSPC handling and fsck after every phase).
-- `run_qemu_test.sh BUILD LOG [-n N] [-t SECS] [-d DISK]`: boot a
-  composed system, wait for N `TEST PASSED/FAILED` lines, stop QEMU.
-- `persist_test.sh [BUILD]`: the two-boot persistence test for
-  `unit_vfs_persist` with host-side checks of the disk image.
+- `persist_test.sh [WORKDIR]`: the two-boot persistence test for
+  `unit_vfs_persist` with host-side checks of the disk image (boots
+  with `tools/qemu_test.sh`).
+
+Running the in-guest tests (from the repository root):
+
+    QEMU_TEST_PASS_COUNT=2 tools/qemu_test.sh composition_scripts/unit_vfs_ramfs.toml
+    tools/qemu_test.sh composition_scripts/unit_vfs_posix.toml
+    truncate -s 64M /tmp/d.img
+    QEMU_TEST_EXTRA="-drive file=/tmp/d.img,if=virtio,format=raw" \
+        tools/qemu_test.sh composition_scripts/unit_vfs_posix_disk.toml
+    rm /tmp/d.img; truncate -s 64M /tmp/d.img
+    QEMU_TEST_EXTRA="-drive file=/tmp/d.img,if=virtio,format=raw" \
+        tools/qemu_test.sh composition_scripts/unit_virtio_blk.toml
+    tools/cosfs/cosfs verify-raw /tmp/d.img $((2048*512)) $((256*512)) 11
+    tools/cosfs/persist_test.sh
 
 The test data pattern (`cosfs_pattern` in `host_env.h`) is the same
 function as `vt_pattern` in the in-Composite tests.

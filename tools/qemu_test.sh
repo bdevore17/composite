@@ -23,6 +23,8 @@
 # Environment overrides:
 #   QEMU_TEST_PASS   extended regex for success (default: "TEST PASSED")
 #   QEMU_TEST_FAIL   extended regex for failure
+#   QEMU_TEST_PASS_COUNT  number of lines matching QEMU_TEST_PASS needed (default 1),
+#                    e.g. 2 for a system with two test components
 #   QEMU_TEST_NAME   build name (default: script basename)
 #   QEMU_TEST_OUT    console log path (default: system_binaries/cos_build-<name>/qemu.log)
 #   QEMU_TEST_MEM    guest memory in MB (default: 8192; capmgr needs it)
@@ -44,6 +46,7 @@ cd "$root" || exit 2
 name=${QEMU_TEST_NAME:-$(basename "$script" .toml)}
 pass_re=${QEMU_TEST_PASS:-"TEST PASSED"}
 fail_re=${QEMU_TEST_FAIL:-"FAULT|assert error|BUG @|Assertion|TEST FAILED|FAILURE"}
+pass_count=${QEMU_TEST_PASS_COUNT:-1}
 mem=${QEMU_TEST_MEM:-8192}
 build=system_binaries/cos_build-$name
 
@@ -93,7 +96,7 @@ while kill -0 "$qpid" 2> /dev/null; do
 		sleep 2	# let the fault report finish printing
 		break
 	fi
-	if grep -aEq "$pass_re" "$out"; then
+	if [ "$(grep -aEc "$pass_re" "$out")" -ge "$pass_count" ]; then
 		verdict=pass
 		sleep 2	# give late failures on other cores a chance to show
 		break
@@ -106,7 +109,7 @@ wait "$qpid" 2> /dev/null
 # Decide on the whole log (QEMU may also have exited on its own).
 if grep -aEq "$fail_re" "$out"; then
 	verdict=fail
-elif grep -aEq "$pass_re" "$out"; then
+elif [ "$(grep -aEc "$pass_re" "$out")" -ge "$pass_count" ]; then
 	verdict=pass
 fi
 

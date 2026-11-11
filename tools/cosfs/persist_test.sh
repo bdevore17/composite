@@ -1,8 +1,10 @@
 #!/bin/bash
 # Persistence test for cosfs on virtio-blk (unit_vfs_persist).
 #
-#   ./cos compose composition_scripts/unit_vfs_persist.toml vfs_persist
-#   tools/cosfs/persist_test.sh [build-name (default vfs_persist)] [workdir]
+#   tools/cosfs/persist_test.sh [workdir]
+#
+# Composes composition_scripts/unit_vfs_persist.toml (build name
+# unit_vfs_persist) and boots it twice with tools/qemu_test.sh.
 #
 # 1. host: mkfs a 64 MiB image and put /from_host.txt into it
 # 2. boot #1 (phase 1): the guest checks the host's file and writes a tree
@@ -13,8 +15,8 @@
 # The expected contents mirror unit_vfs_persist.c. Run from the repository root.
 
 set -u
-name=${1:-vfs_persist}
-work=${2:-$(mktemp -d)}
+script=composition_scripts/unit_vfs_persist.toml
+work=${1:-$(mktemp -d)}
 img=$work/persist.img
 tool=tools/cosfs/cosfs
 fail=0
@@ -56,7 +58,12 @@ printf 'written by the host\n' > "$work/from_host.txt"
 $tool put "$img" "$work/from_host.txt" /from_host.txt || exit 2
 
 step "boot 1: phase 1"
-check "boot 1 passed" tools/cosfs/run_qemu_test.sh "$name" "$work/boot1.log" -d "$img"
+boot() {
+	# boot <log> [no-compose]: run the guest on the image
+	QEMU_TEST_OUT=$1 QEMU_TEST_NO_COMPOSE=${2:-} QEMU_TEST_EXTRA="-drive file=$img,if=virtio,format=raw" \
+		tools/qemu_test.sh "$script" 900
+}
+check "boot 1 passed" boot "$work/boot1.log"
 
 step "host: check phase 1's files"
 check "fsck after boot 1" $tool fsck "$img"
@@ -68,7 +75,7 @@ check "renamed exists" $tool cat "$img" /persist/renamed
 check "deleted is gone" bash -c "! $tool cat '$img' /persist/deleted"
 
 step "boot 2: phase 2"
-check "boot 2 passed" tools/cosfs/run_qemu_test.sh "$name" "$work/boot2.log" -d "$img"
+check "boot 2 passed" boot "$work/boot2.log" 1
 
 step "host: check phase 2's changes"
 check "fsck after boot 2" $tool fsck "$img"

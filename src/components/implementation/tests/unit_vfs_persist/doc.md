@@ -13,5 +13,4 @@ driven by `tools/cosfs/persist_test.sh`:
    truncates and deletes files;
 5. the host checks the image again.
 
-    ./cos compose composition_scripts/unit_vfs_persist.toml vfs_persist
-    tools/cosfs/persist_test.sh vfs_persist
+    tools/cosfs/persist_test.sh   # composes and boots via tools/qemu_test.sh
