@@ -2097,3 +2097,34 @@ cos_cons_into_shared_pgtbl(struct cos_compinfo *ci, pgtblcap_t top_lvl)
 	return 0;
 
 }
+
+int
+cos_comp_recovery_register(struct cos_compinfo *ci, compcap_t comp, sinvcap_t handler)
+{
+	(void)ci;
+	return call_cap_op(comp, CAPTBL_OP_COMP_RECOVERY_REGISTER, handler, 0, 0, 0);
+}
+
+word_t
+cos_comp_upcall(compcap_t comp, upcall_type_t type, word_t a1, word_t a2, word_t a3)
+{
+	return call_cap_op(comp, CAPTBL_OP_COMP_UPCALL, type, a1, a2, a3);
+}
+
+int
+cos_comp_recovery_quiesce(compcap_t comp)
+{
+	return call_cap_op(comp, CAPTBL_OP_COMP_RECOVERY_QUIESCE, 0, 0, 0, 0);
+}
+
+int
+cos_comp_recovery_quiescent(compcap_t comp, int req)
+{
+	return call_cap_op(comp, CAPTBL_OP_COMP_RECOVERY_QUIESCENT, req, 0, 0, 0);
+}
+
+int
+cos_comp_recovery_resume(compcap_t comp, word_t retval)
+{
+	return call_cap_op(comp, CAPTBL_OP_COMP_RECOVERY_RESUME, retval, 0, 0, 0);
+}

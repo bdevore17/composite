@@ -253,8 +253,13 @@ start_execution(coreid_t cid, int init_core, int ncores)
 			cos_init();
 			/* continue only if there is no user-defined main, or parallel exec */
 			COS_EXTERN_INV(init_done)(parallel_init, main_type);
-			/* Shouldn't return if we don't want to run parallel init or main */
-			assert(parallel_init || main_type != INIT_MAIN_NONE);
+			/*
+			 * The booter's init_done doesn't return if we
+			 * don't run a parallel init or main, but the
+			 * scheduler's does: it coordinates the end of
+			 * the initialization on all cores in the next
+			 * init_done.
+			 */
 		}
 
 		/* Parallel initialization awaits `cos_init` completion */
@@ -295,11 +300,37 @@ cos_inv_cap_set(struct usr_inv_cap *uc)
 }
 #endif
 
-CWEAKSYMB void
+/*
+ * Component recovery (see the capmgr's documentation): which of the
+ * initialization functions does this component define? A component
+ * that defines only `cos_init` can be reset and re-initialized by its
+ * manager.
+ */
+static word_t
+cos_recovery_flags(void)
+{
+	word_t flags = COS_RECOVERY_CAPABLE;
+
+	if (parallel_main != __crt_parallel_main || cos_main_defined()) flags |= COS_RECOVERY_MAIN;
+	if (cos_parallel_init != __crt_cos_parallel_init) flags |= COS_RECOVERY_PARALLEL_INIT;
+
+	return flags;
+}
+
+/*
+ * The entry point of upcalls into the component: thread creation, and
+ * the component recovery upcalls (COS_UPCALL_RECOVER_*), which are
+ * synchronous invocations from the component's manager, and return
+ * to it (the return value is the invocation's).
+ */
+CWEAKSYMB word_t
 cos_upcall_fn(upcall_type_t t, void *arg1, void *arg2, void *arg3)
 {
 	static int first = 1;
 	static	struct ps_lock _lock = {0};
+
+	/* This must not touch any state: it can be called at any time. */
+	if (t == COS_UPCALL_RECOVER_QUERY) return cos_recovery_flags();
 
 	/*
 	 * There should be no concurrency at initialization (the init
@@ -371,13 +402,25 @@ cos_upcall_fn(upcall_type_t t, void *arg1, void *arg2, void *arg3)
 		}
 		break;
 	}
+	case COS_UPCALL_RECOVER_INIT:
+		/*
+		 * Our manager reset our memory to its initial state
+		 * (thus `first` was set again, and the libc and the
+		 * constructors were initialized again above): run our
+		 * initialization again, on the manager's thread, and
+		 * return to it.
+		 */
+		if (cos_recovery_flags() != COS_RECOVERY_CAPABLE) return -EINVAL;
+		cos_init();
+
+		return 0;
 	default:
 		/* fault! */
 		assert(0);
 	}
 	assert(0); 		/* should *not* return from threads */
 
-	return;
+	return 0;
 }
 
 CWEAKSYMB void *

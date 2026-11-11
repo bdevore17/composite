@@ -58,6 +58,7 @@ struct crt_sinv {
 	char *name;
 	struct crt_comp *server, *client;
 	vaddr_t c_fn_addr, c_ucap_addr;
+	vaddr_t c_alt_fn;	/* the client's user-level callgate, if any */
 	vaddr_t s_fn_addr;
 	sinvcap_t sinv_cap;
 };
@@ -208,6 +209,10 @@ int crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, 
 int crt_sinv_create_shared(struct crt_sinv *sinv, char *name, struct crt_comp *server, struct crt_comp *client, vaddr_t c_fn_addr, vaddr_t c_ucap_addr, vaddr_t s_fn_addr);
 
 int crt_sinv_alias_in(struct crt_sinv *s, struct crt_comp *c, struct crt_sinv_resources *res);
+void crt_sinv_ucap_restore(struct crt_sinv *sinv);
+
+/* Component recovery: reset the component's writable memory to its initial state */
+int crt_comp_image_reset(struct crt_comp *c);
 
 int crt_asnd_create(struct crt_asnd *s, struct crt_rcv *r);
 int crt_asnd_alias_in(struct crt_asnd *s, struct crt_comp *c, struct crt_asnd_resources *res);

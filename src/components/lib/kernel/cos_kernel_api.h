@@ -344,4 +344,35 @@ void cos_thd_id_free(thdid_t tid);
 pgtblcap_t cos_shared_pgtbl_alloc(void);
 u32_t cos_cons_into_shared_pgtbl(struct cos_compinfo *ci, pgtblcap_t top_lvl);
 
+/*
+ * Component recovery (see the kernel's recovery.h). These operate on
+ * the capability to a component, comp, held by its manager.
+ *
+ * - cos_comp_recovery_register: faults in comp (in synchronous
+ *   invocations) are recoverable, and are redirected to the
+ *   synchronous invocation `handler` (in ci's capability table). The
+ *   handler is called with cos_inv_token() == the handler sinv's
+ *   token, and the arguments (fault type (cos_flt_off), fault
+ *   address, fault instruction pointer, faulting thread id), and
+ *   executes on the faulting thread. comp is then suspended: its
+ *   invocations fail with -ECOMPRESET.
+ * - cos_comp_upcall: invoke comp's upcall function,
+ *   cos_upcall_fn(type, a1, a2, a3), on the current thread (also
+ *   while comp is suspended), and return its return value.
+ * - cos_comp_recovery_quiesce: make all cores stop executing in
+ *   suspended components (threads executing in them return
+ *   -ECOMPRESET to their callers). Returns a request id (> 0).
+ * - cos_comp_recovery_quiescent: -EAGAIN until all cores processed
+ *   request req, then the number of threads executing in other
+ *   components on behalf of (suspended) comp.
+ * - cos_comp_recovery_resume: comp's recovery is complete: make it
+ *   available again, and return retval from the current invocation
+ *   (the fault handler). Doesn't return on success.
+ */
+int    cos_comp_recovery_register(struct cos_compinfo *ci, compcap_t comp, sinvcap_t handler);
+word_t cos_comp_upcall(compcap_t comp, upcall_type_t type, word_t a1, word_t a2, word_t a3);
+int    cos_comp_recovery_quiesce(compcap_t comp);
+int    cos_comp_recovery_quiescent(compcap_t comp, int req);
+int    cos_comp_recovery_resume(compcap_t comp, word_t retval);
+
 #endif /* COS_KERNEL_API_H */

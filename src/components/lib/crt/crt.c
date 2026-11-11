@@ -686,8 +686,6 @@ crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, stru
 {
 	struct cos_compinfo *cli;
 	struct cos_compinfo *srv;
-	unsigned int ucap_off;
-	struct usr_inv_cap *ucap;
 	compcap_t comp_s;
 	callgate_fn_t alt_fn = NULL;
 
@@ -732,6 +730,23 @@ crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, stru
 		alt_fn = (callgate_fn_t)c_fast_callgate_addr;
 	}
 
+	sinv->c_alt_fn = (vaddr_t)alt_fn;
+	crt_sinv_ucap_restore(sinv);
+
+	return 0;
+}
+
+/*
+ * Write the user-level capability (in the client's memory) through
+ * which the client makes the invocation. Used by crt_sinv_create, and
+ * when the client's memory is reset (crt_comp_image_reset).
+ */
+void
+crt_sinv_ucap_restore(struct crt_sinv *sinv)
+{
+	struct usr_inv_cap *ucap;
+	unsigned int ucap_off;
+
 	/* poor-mans virtual address translation from client VAS -> our ptrs */
 	assert(sinv->c_ucap_addr - sinv->client->ro_addr > 0);
 	ucap_off = sinv->c_ucap_addr - sinv->client->ro_addr;
@@ -739,8 +754,41 @@ crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, stru
 	*ucap = (struct usr_inv_cap) {
 		.invocation_fn = sinv->c_fn_addr,
 		.cap_no        = sinv->sinv_cap,
-		.alt_fn        = alt_fn,
+		.alt_fn        = (callgate_fn_t)sinv->c_alt_fn,
 	};
+}
+
+/**
+ * Reset the writable memory of component c (data and bss) to its
+ * initial state, from its ELF object, as crt_comp_create loaded it.
+ * The user-level capabilities of its synchronous invocations (in its
+ * data) must be restored afterwards (crt_sinv_ucap_restore). Used by
+ * component recovery: c must not execute, and must have been created
+ * by crt_comp_create.
+ *
+ * @return: 0 on success, != 0 on error.
+ */
+int
+crt_comp_image_reset(struct crt_comp *c)
+{
+	struct cos_component_information *comp_info;
+	vaddr_t ro_addr, rw_addr;
+	size_t  ro_sz, data_sz, bss_sz;
+	char   *ro_src, *data_src, *rw;
+
+	assert(c);
+	if (!c->elf_hdr || !c->mem || c->ns_vas || (c->flags & (CRT_COMP_BOOTER | CRT_COMP_SCHED | CRT_COMP_CAPMGR | CRT_COMP_VM))) {
+		return -EINVAL;
+	}
+	if (elf_load_info(c->elf_hdr, &ro_addr, &ro_sz, &ro_src, &rw_addr, &data_sz, &data_src, &bss_sz)) return -EINVAL;
+	if (ro_addr != c->ro_addr || rw_addr != c->rw_addr || ro_sz != c->ro_sz) return -EINVAL;
+
+	rw = c->mem + round_up_to_page(ro_sz);
+	memcpy(rw, data_src, data_sz);
+	memset(rw + data_sz, 0, bss_sz);
+
+	comp_info = (struct cos_component_information *)(rw + (c->info - c->rw_addr));
+	comp_info->cos_this_spd_id = c->id;
 
 	return 0;
 }

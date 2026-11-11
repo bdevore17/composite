@@ -39,13 +39,11 @@ __cosrt_upcall_entry:			\
 	/* ABI mandate a 16-byte alignment stack pointer*/ \
 	and $~0xf, %rsp;		\
 	call cos_upcall_fn;		\
-	addl $24, %esp;			\
-	pop %rsi;			\
-	pop %rdi;			\
-	movl %eax, %ecx;		\
-	movl $RET_CAP, %eax;		\
+	/* Only the recovery upcalls (synchronous invocations) return: return to the invoker */ \
+	mov %rax, %r8;			\
+	mov $RET_CAP, %rax;		\
 	COS_ASM_RET_STACK		\
-	sysenter;
+	syscall;
 
 #define COS_ATOMIC_CMPXCHG 		\
 	movl %eax, %edx;		\
