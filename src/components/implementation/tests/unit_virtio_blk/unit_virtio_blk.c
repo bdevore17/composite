@@ -91,7 +91,8 @@ test_large_unaligned(void)
 	memset(shm, 0, SHM_SIZE);
 	VT_CHECK(blkdev_read(5000, nsect, off) == (long)nsect);
 	VT_CHECK(check(off, nsect * 512, 5000 * 512, 3));
-	/* read it back again at a different alignment */
+	/* read (most of) it back again at a different alignment */
+	nsect = (SHM_SIZE - 3000) / 512;
 	memset(shm, 0, SHM_SIZE);
 	VT_CHECK(blkdev_read(5000, nsect, 3000) == (long)nsect);
 	VT_CHECK(check(3000, nsect * 512, 5000 * 512, 3));
