@@ -1,0 +1,44 @@
+[system]
+description = "Starting and stopping components at runtime: deferred components (boot = \"deferred\") started and stopped through the scheduler's loader interface."
+
+[[components]]
+name = "booter"
+img  = "no_interface.llbooter"
+implements = [{interface = "init"}, {interface = "addr"}]
+deps = [{srv = "kernel", interface = "init", variant = "kernel"}]
+constructor = "kernel"
+
+[[components]]
+name = "capmgr"
+img  = "capmgr.simple"
+deps = [{srv = "booter", interface = "init"}, {srv = "booter", interface = "addr"}]
+implements = [{interface = "capmgr"}, {interface = "init"}, {interface = "memmgr"}, {interface = "capmgr_create"}]
+constructor = "booter"
+
+[[components]]
+name = "sched"
+img  = "sched.pfprr_quantum_static"
+deps = [{srv = "capmgr", interface = "init"}, {srv = "capmgr", interface = "capmgr"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "sched"}, {interface = "init"}, {interface = "loader"}]
+constructor = "booter"
+
+[[components]]
+name = "loadsrv"
+img  = "tests.unit_loader_server"
+boot = "deferred"
+deps = [{srv = "sched", interface = "init"}, {srv = "sched", interface = "sched"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "loadtest"}]
+constructor = "booter"
+
+[[components]]
+name = "loadmain"
+img  = "tests.unit_loader_main"
+boot = "deferred"
+deps = [{srv = "sched", interface = "init"}, {srv = "sched", interface = "sched"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "loadsrv", interface = "loadtest"}]
+constructor = "booter"
+
+[[components]]
+name = "client"
+img  = "tests.unit_loader"
+deps = [{srv = "sched", interface = "init"}, {srv = "sched", interface = "sched"}, {srv = "sched", interface = "loader"}, {srv = "capmgr", interface = "capmgr_create"}, {srv = "capmgr", interface = "memmgr"}, {srv = "loadsrv", interface = "loadtest"}]
+constructor = "booter"
