@@ -164,9 +164,25 @@ __arcv_teardown(struct cap_arcv *arcv, struct thread *thd)
 	struct thread *notif;
 	struct tcap *  tcap;
 
+	/*
+	 * The binding is torn down by the first deactivation of any
+	 * copy of the arcv capability (an alias, or the original), so
+	 * later deactivations of the other copies have nothing left to
+	 * do.
+	 */
+	if (!thd_bound2rcvcap(thd)) return 0;
+
 	tcap = thd->rcvcap.rcvcap_tcap;
 	assert(tcap);
-	if (tcap_ref(tcap) > 1 && tcap->arcv_ep == thd) return -1;
+	/*
+	 * The tcap holds one reference for its own capability
+	 * (__tcap_init) and one per bound arcv (__arcv_setup). The
+	 * thread that the tcap's budget runs (arcv_ep) cannot be
+	 * removed while other rcv end-points still use the tcap.
+	 */
+	if (tcap_ref(tcap) > 2 && tcap->arcv_ep == thd) return -1;
+	/* If this core is executing with this tcap, its expiration would find no end-point. */
+	if (tcap_current(cos_cpu_local_info()) == tcap) return -1;
 
 	notif = thd->rcvcap.rcvcap_thd_notif;
 	if (notif) thd_rcvcap_release(notif);
@@ -174,7 +190,14 @@ __arcv_teardown(struct cap_arcv *arcv, struct thread *thd)
 
 	thd->rcvcap.rcvcap_tcap = NULL;
 	tcap_ref_release(tcap);
-	tcap->arcv_ep = NULL;
+	if (tcap->arcv_ep == thd) {
+		/*
+		 * The tcap has no end-point anymore, so it must not be
+		 * chosen for execution when a budget expires.
+		 */
+		tcap->arcv_ep = NULL;
+		if (tcap_is_active(tcap)) tcap_active_rem(tcap);
+	}
 
 	return 0;
 }

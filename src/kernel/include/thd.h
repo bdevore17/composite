@@ -439,6 +439,15 @@ thd_deactivate(struct captbl *ct, struct cap_captbl *dest_ct, unsigned long capi
 		/* last ref cannot be removed if bound to arcv cap */
 		if (thd_bound2rcvcap(thd)) cos_throw(err, -EBUSY);
 		/*
+		 * The thread's memory is released below. The kernel
+		 * only reaches a thread's per-core scheduling state
+		 * (the scheduler's event list, next_ti) from its home
+		 * core, so release it there, and never while it
+		 * executes (e.g. a thread deleting itself).
+		 */
+		if (thd->cpuid != get_cpuid()) cos_throw(err, -EINVAL);
+		if (thd == thd_current(cli)) cos_throw(err, -EBUSY);
+		/*
 		 * Last reference. Require pgtbl and cos_frame cap to
 		 * release the kmem page.
 		 */
@@ -465,6 +474,8 @@ thd_deactivate(struct captbl *ct, struct cap_captbl *dest_ct, unsigned long capi
 	/* deactivation success */
 	if (thd->refcnt == 0) {
 		if (cli->next_ti.thd == thd) thd_next_thdinfo_update(cli, 0, 0, 0, 0);
+		/* Remove pending (unconsumed) scheduling events of this thread. */
+		if (!list_empty(&thd->event_list)) list_rem(&thd->event_list);
 
 		/* move the kmem for the thread to a location
 		 * in a pagetable as COSFRAME */
