@@ -1,0 +1,36 @@
+[system]
+description = "virtio-blk driver: raw sector read/write round trips. Run QEMU with -drive file=<scratch image of >= 16 MiB>,if=virtio,format=raw"
+
+[[components]]
+name = "booter"
+img  = "no_interface.llbooter"
+implements = [{interface = "init"}, {interface = "addr"}]
+deps = [{srv = "kernel", interface = "init", variant = "kernel"}]
+constructor = "kernel"
+
+[[components]]
+name = "capmgr"
+img  = "capmgr.simple"
+deps = [{srv = "booter", interface = "init"}, {srv = "booter", interface = "addr"}]
+implements = [{interface = "capmgr"}, {interface = "init"}, {interface = "memmgr"}, {interface = "capmgr_create"}, {interface = "contigmem"}]
+constructor = "booter"
+
+[[components]]
+name = "sched"
+img  = "sched.pfprr_quantum_static"
+deps = [{srv = "capmgr", interface = "init"}, {srv = "capmgr", interface = "capmgr"}, {srv = "capmgr", interface = "memmgr"}]
+implements = [{interface = "sched"}, {interface = "init"}]
+constructor = "booter"
+
+[[components]]
+name = "blkdev"
+img  = "blkdev.virtio"
+deps = [{srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}, {srv = "capmgr", interface = "contigmem"}]
+implements = [{interface = "blkdev"}]
+constructor = "booter"
+
+[[components]]
+name = "blktest"
+img  = "tests.unit_virtio_blk"
+deps = [{srv = "blkdev", interface = "blkdev"}, {srv = "sched", interface = "init"}, {srv = "capmgr", interface = "memmgr"}]
+constructor = "booter"
