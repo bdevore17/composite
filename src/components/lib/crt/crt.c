@@ -1392,6 +1392,13 @@ crt_clear_schedevents(void)
 	assert(sched_aep->rcv != 0);
 	while (pending) {
 		pending = cos_sched_rcv(sched_aep->rcv, RCV_NON_BLOCKING, TCAP_TIME_NIL, &rcvd, &tid, &blocked, &cycles, &thd_timeout);
+		/*
+		 * A non-blocking receive with no pending events
+		 * returns -EAGAIN. Whether there are any events here
+		 * depends on how initialization interleaved with
+		 * interrupts on this core, so this is not an error.
+		 */
+		if (pending == -EAGAIN) break;
 		assert(pending >= 0);
 	}
 
@@ -1405,6 +1412,7 @@ crt_clear_schedevents(void)
 void
 crt_compinit_execute(comp_get_fn_t comp_get)
 {
+	static unsigned long mains_completed = 0;
 	struct initargs comps, curr;
 	struct initargs_iter i;
 	int cont;
@@ -1509,8 +1517,16 @@ crt_compinit_execute(comp_get_fn_t comp_get)
 		}
 	}
 
-	printc("%ld: All main functions returned: shutting down...\n", cos_compid());
-	cos_hw_shutdown(BOOT_CAPTBL_SELF_INITHW_BASE);
+	/*
+	 * Each core gets here once the mains it runs have returned,
+	 * but the other cores might still be executing theirs (e.g.
+	 * a single `main` on the init core, after a `parallel_main`
+	 * everywhere). Only shut down once every core is done.
+	 */
+	if (ps_faa(&mains_completed, 1) + 1 == (unsigned long)init_parallelism()) {
+		printc("%ld: All main functions returned: shutting down...\n", cos_compid());
+		cos_hw_shutdown(BOOT_CAPTBL_SELF_INITHW_BASE);
+	}
 	while (1) ;
 
 	BUG();
