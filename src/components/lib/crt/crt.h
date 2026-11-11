@@ -208,6 +208,16 @@ int crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, 
 int crt_sinv_create_shared(struct crt_sinv *sinv, char *name, struct crt_comp *server, struct crt_comp *client, vaddr_t c_fn_addr, vaddr_t c_ucap_addr, vaddr_t s_fn_addr);
 
 int crt_sinv_alias_in(struct crt_sinv *s, struct crt_comp *c, struct crt_sinv_resources *res);
+/*
+ * Support for components started at runtime: invocations to a server
+ * that isn't running are redirected to a function returning an error,
+ * the server's (or client's) memory image is reset to the elf
+ * object's, and the client's ucaps rewritten.
+ */
+int crt_sinv_retarget(struct crt_sinv *sinv, compcap_t comp, vaddr_t entry);
+int crt_sinv_activate(struct crt_sinv *sinv);
+void crt_sinv_ucap_write(struct crt_sinv *sinv, callgate_fn_t alt_fn);
+int crt_comp_image_reset(struct crt_comp *c);
 
 int crt_asnd_create(struct crt_asnd *s, struct crt_rcv *r);
 int crt_asnd_alias_in(struct crt_asnd *s, struct crt_comp *c, struct crt_asnd_resources *res);

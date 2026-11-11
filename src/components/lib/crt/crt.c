@@ -437,6 +437,41 @@ crt_comp_create(struct crt_comp *c, char *name, compid_t id, void *elf_hdr, vadd
 	return 0;
 }
 
+/**
+ * Reset the memory image of a component created with
+ * `crt_comp_create` to its initial state from the elf object: the
+ * read-only and data sections are copied again, the bss zeroed, and
+ * the component id set. This is what the component's memory looked
+ * like when it was created, before it executed. Note that this
+ * includes the client side of its synchronous invocations (ucaps)
+ * that must be restored (crt_sinv_ucap_write) for its invocations to
+ * work. The component must not execute while this happens.
+ *
+ * @return: 0 on success, != 0 on error.
+ */
+int
+crt_comp_image_reset(struct crt_comp *c)
+{
+	struct cos_component_information *comp_info;
+	vaddr_t ro_addr, rw_addr;
+	size_t  ro_sz, data_sz, bss_sz;
+	char   *ro_src, *data_src;
+
+	assert(c && c->mem && c->elf_hdr);
+	if (elf_load_info(c->elf_hdr, &ro_addr, &ro_sz, &ro_src, &rw_addr, &data_sz, &data_src, &bss_sz)) return -EINVAL;
+	if (ro_addr != c->ro_addr || rw_addr != c->rw_addr || ro_sz != c->ro_sz) return -EINVAL;
+	if (round_up_to_page(round_up_to_page(ro_sz) + data_sz + bss_sz) != c->tot_sz_mem) return -EINVAL;
+
+	memcpy(c->mem, ro_src, ro_sz);
+	memcpy(c->mem + round_up_to_page(ro_sz), data_src, data_sz);
+	memset(c->mem + round_up_to_page(ro_sz) + data_sz, 0, c->tot_sz_mem - (round_up_to_page(ro_sz) + data_sz));
+
+	comp_info = (struct cos_component_information *)(c->mem + round_up_to_page(ro_sz) + (c->info - c->rw_addr));
+	comp_info->cos_this_spd_id = c->id;
+
+	return 0;
+}
+
 int
 crt_vm_comp_init(struct crt_comp *c, char *name, compid_t id, vaddr_t info)
 {
@@ -686,8 +721,6 @@ crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, stru
 {
 	struct cos_compinfo *cli;
 	struct cos_compinfo *srv;
-	unsigned int ucap_off;
-	struct usr_inv_cap *ucap;
 	compcap_t comp_s;
 	callgate_fn_t alt_fn = NULL;
 
@@ -732,6 +765,65 @@ crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, stru
 		alt_fn = (callgate_fn_t)c_fast_callgate_addr;
 	}
 
+	crt_sinv_ucap_write(sinv, alt_fn);
+
+	return 0;
+}
+
+/*
+ * Make the sinv's capability in the client invoke `entry` in
+ * component `comp` (a component capability in our capability table)
+ * instead of the server, or (with crt_sinv_activate) the server
+ * again. This is used to make invocations of a server that isn't
+ * running fail: the client keeps the same capability (and ucap), but
+ * it invokes a function that returns an error instead. The capability
+ * is deactivated with liveness id 0 and reactivated in the same slot
+ * (it only ever holds this client's sinv), so there is no quiescence
+ * to wait for. Invocations between the two operations fail as for
+ * any invalid capability.
+ */
+int
+crt_sinv_retarget(struct crt_sinv *sinv, compcap_t comp, vaddr_t entry)
+{
+	struct cos_compinfo *cli;
+	int ret;
+
+	assert(sinv && sinv->sinv_cap && comp && entry);
+	cli = cos_compinfo_get(sinv->client->comp_res);
+
+	if ((ret = call_cap_op(cli->captbl_cap, CAPTBL_OP_SINVDEACTIVATE, sinv->sinv_cap, 0, 0, 0))) return ret;
+
+	return call_cap_op(cli->captbl_cap, CAPTBL_OP_SINVACTIVATE, sinv->sinv_cap, comp, entry, sinv->client->id);
+}
+
+/* Make the sinv invoke its server again, after crt_sinv_retarget */
+int
+crt_sinv_activate(struct crt_sinv *sinv)
+{
+	struct cos_compinfo *srv;
+	compcap_t comp_s;
+
+	assert(sinv);
+	srv    = cos_compinfo_get(sinv->server->comp_res);
+	comp_s = (srv->comp_cap_shared) ? srv->comp_cap_shared : srv->comp_cap;
+
+	return crt_sinv_retarget(sinv, comp_s, sinv->s_fn_addr);
+}
+
+/*
+ * Write the user-level invocation capability (ucap) for the sinv into
+ * the client's memory. The client uses it to make the invocation:
+ * c_fn_addr is the client stub, and sinv_cap the capability. Used to
+ * restore the ucap after the client's image is reset
+ * (crt_comp_image_reset). Only for components in exclusive address
+ * spaces, which don't use user-level (MPK) invocations (alt_fn).
+ */
+void
+crt_sinv_ucap_write(struct crt_sinv *sinv, callgate_fn_t alt_fn)
+{
+	struct usr_inv_cap *ucap;
+	unsigned int ucap_off;
+
 	/* poor-mans virtual address translation from client VAS -> our ptrs */
 	assert(sinv->c_ucap_addr - sinv->client->ro_addr > 0);
 	ucap_off = sinv->c_ucap_addr - sinv->client->ro_addr;
@@ -741,8 +833,6 @@ crt_sinv_create(struct crt_sinv *sinv, char *name, struct crt_comp *server, stru
 		.cap_no        = sinv->sinv_cap,
 		.alt_fn        = alt_fn,
 	};
-
-	return 0;
 }
 
 int
