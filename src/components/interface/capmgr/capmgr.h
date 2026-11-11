@@ -49,6 +49,31 @@ thdcap_t  COS_STUB_DECL(capmgr_aep_create_ext)(spdid_t child, struct cos_aep_inf
 arcvcap_t capmgr_rcv_create(thdclosure_index_t idx, int flags, asndcap_t *asnd, thdcap_t *thdcap, thdid_t *tid);
 arcvcap_t COS_STUB_DECL(capmgr_rcv_create)(thdclosure_index_t idx, int flags, asndcap_t *asnd, thdcap_t *thdcap, thdid_t *tid);
 
+/*
+ * Release a thread created by capmgr_thd_create* (in any component)
+ * on behalf of the calling component, which must be the component the
+ * thread capability was given to (the scheduler, or the component
+ * itself for capmgr_thd_create). The thread, its capabilities and
+ * kernel memory are deallocated, and its thread id can be reused. The
+ * thread must not be executing: call this on the core the thread was
+ * created on, and not on the thread itself. Returns 0 on success,
+ * -EINVAL if tid is unknown or on another core, -EPERM if the caller
+ * doesn't have the thread, -EBUSY if it is the calling thread, or the
+ * kernel's error.
+ */
+int capmgr_thd_release(thdid_t tid);
+int COS_STUB_DECL(capmgr_thd_release)(thdid_t tid);
+
+/*
+ * Release a rcv end-point created by capmgr_rcv_create (identified by
+ * its thread's tid), along with its asnd, thread, and capabilities.
+ * Same constraints as capmgr_thd_release. The kernel cannot free
+ * tcaps, so the rcv's tcap is kept by the capmgr and reused for this
+ * component's next rcv on the same core.
+ */
+int capmgr_rcv_release(thdid_t tid);
+int COS_STUB_DECL(capmgr_rcv_release)(thdid_t tid);
+
 asndcap_t capmgr_asnd_create(spdid_t child, thdid_t t);
 asndcap_t COS_STUB_DECL(capmgr_asnd_create)(spdid_t child, thdid_t t);
 

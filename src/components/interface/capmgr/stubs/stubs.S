@@ -16,6 +16,8 @@ cos_asm_stub_indirect(capmgr_aep_create_thunk)
 cos_asm_stub_indirect(capmgr_aep_create_ext)
 
 cos_asm_stub_indirect(capmgr_rcv_create)
+cos_asm_stub(capmgr_thd_release)
+cos_asm_stub(capmgr_rcv_release)
 
 cos_asm_stub(capmgr_set_tls)
 cos_asm_stub(capmgr_asnd_create)
