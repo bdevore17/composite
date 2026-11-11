@@ -5,6 +5,8 @@
  * Author: Gabe Parmer, gparmer@gwu.edu
  */
 
+#include <stdlib.h>
+
 #include <cos_debug.h>
 #include <consts.h>
 #include <static_slab.h>
@@ -50,6 +52,15 @@ struct mm_runlist {
 	struct mm_run *head, *tail;
 };
 
+/* The state of components started at runtime, see capmgr_comp_start */
+typedef enum {
+	CM_DEFERRED_NONE = 0,	/* not deferred: initialized at boot */
+	CM_DEFERRED_STOPPED,
+	CM_DEFERRED_STARTING,
+	CM_DEFERRED_RUNNING,
+	CM_DEFERRED_STOPPING,
+} cm_deferred_t;
+
 struct cm_comp {
 	struct crt_comp comp;
 	struct cm_rcv *sched_rcv[NUM_CPU];    /* rcv cap for this scheduler or NULL if not a scheduler */
@@ -57,6 +68,10 @@ struct cm_comp {
 
 	struct cm_tcap_pool tcap_pool[NUM_CPU];
 	struct mm_runlist   va_free; /* freed virtual address ranges of this component, see mm_va_get */
+
+	unsigned long deferred;	  /* cm_deferred_t */
+	vaddr_t       heap_start; /* the first address we map memory at (deferred components) */
+	int           va_pinned;  /* has mappings that are never released (see mm_comp_release) */
 };
 
 struct cm_thd {
@@ -110,6 +125,14 @@ SS_STATIC_SLAB(asnd, struct cm_asnd, MAX_NUM_THREADS);
 #define MM_NPAGES (MB2PAGES(9000))
 SS_STATIC_SLAB(page, struct mm_page, MM_NPAGES);
 SS_STATIC_SLAB(span, struct mm_span, MM_NPAGES);
+/* The highest span id allocated, to find all spans (mm_comp_release) */
+static unsigned int mm_span_hw;
+
+static void
+mm_span_hw_update(struct mm_span *s)
+{
+	if (ss_span_id(s) > mm_span_hw) mm_span_hw = ss_span_id(s);
+}
 
 /* CONTIG_PHY_PAGES: Total size (in pages) of the contiguous physical memory region */
 #define CONTIG_PHY_PAGES 300000
@@ -511,7 +534,14 @@ mm_frames_get(unsigned long npages)
 static void
 mm_va_put(struct cm_comp *c, vaddr_t addr, unsigned long npages, u64_t ts)
 {
-	struct mm_run *r = mm_run_alloc();
+	struct mm_run *r = c->va_free.tail;
+
+	/* Extend the last range when freeing consecutive addresses together */
+	if (r && r->ts == ts && r->addr + r->npages * PAGE_SIZE == addr) {
+		r->npages += npages;
+		return;
+	}
+	r = mm_run_alloc();
 
 	/* Without a descriptor, the address range is simply not reused. */
 	if (!r) return;
@@ -535,17 +565,39 @@ mm_va_get(struct cm_comp *c, unsigned long npages, unsigned long align)
 	vaddr_t ret;
 
 	for (r = c->va_free.head; r; prev = r, r = r->next) {
+		vaddr_t end = r->addr + r->npages * PAGE_SIZE;
+		struct mm_run *t;
+
 		/* Ordered by ts: the following ones aren't quiescent either */
 		if (!mm_quiescent(r->ts)) break;
-		if (r->npages < npages || r->addr % align != 0) continue;
+		ret = ((r->addr + align - 1) / align) * align;
+		if (ret + npages * PAGE_SIZE > end) continue;
 
-		ret        = r->addr;
-		r->addr   += npages * PAGE_SIZE;
-		r->npages -= npages;
-		if (r->npages == 0) {
-			mm_runlist_remove(&c->va_free, r, prev);
-			mm_run_free(r);
+		if (ret == r->addr) {
+			r->addr   += npages * PAGE_SIZE;
+			r->npages -= npages;
+			if (r->npages == 0) {
+				mm_runlist_remove(&c->va_free, r, prev);
+				mm_run_free(r);
+			}
+
+			return ret;
 		}
+
+		/* Aligned within the range: split it around the allocation */
+		if (ret + npages * PAGE_SIZE < end) {
+			t = mm_run_alloc();
+			if (!t) continue;
+			*t = (struct mm_run) {
+				.addr   = ret + npages * PAGE_SIZE,
+				.npages = (end - (ret + npages * PAGE_SIZE)) / PAGE_SIZE,
+				.ts     = r->ts,
+				.next   = r->next,
+			};
+			r->next = t;
+			if (c->va_free.tail == r) c->va_free.tail = t;
+		}
+		r->npages = (ret - r->addr) / PAGE_SIZE;
 
 		return ret;
 	}
@@ -842,6 +894,7 @@ contigmem_alloc(unsigned long npages)
 	if (!c) return 0;
 
 	ps_lock_take(&mm_lock);
+	c->va_pinned = 1;	/* contiguous memory is never released */
 	page = contig_phy_pages;
 	if (crt_page_aliasn_aligned_in(page, PAGE_SIZE, npages, &cm_self()->comp, &c->comp, &vaddr)) BUG();
 	contigmem_pages_track(c, page, vaddr, npages);
@@ -870,6 +923,8 @@ contigmem_shared_alloc_aligned_flags(unsigned long npages, unsigned long align, 
 	ps_lock_take(&mm_lock);
 	s = ss_span_alloc();
 	if (!s) ERR_THROW(0, done);
+	mm_span_hw_update(s);
+	c->va_pinned = 1;	/* contiguous memory is never released */
 
 	page = contig_phy_pages;
 	if (readonly) {
@@ -993,6 +1048,7 @@ memmgr_map_phys_to_virt(paddr_t paddr, size_t size)
 
 	c = ss_comp_get(cos_inv_token());
 	if (!c) return 0;
+	c->va_pinned = 1;	/* device memory is never unmapped */
 
 	return (vaddr_t)cos_hw_map(&c->comp.comp_res->ci, BOOT_CAPTBL_SELF_INITHW_BASE, paddr, size);
 }
@@ -1012,6 +1068,7 @@ memmgr_shared_page_allocn_aligned(unsigned long num_pages, unsigned long align, 
 	ps_lock_take(&mm_lock);
 	s = ss_span_alloc();
 	if (!s) ERR_THROW(0, done);
+	mm_span_hw_update(s);
 	p = mm_pages_alloc(c, num_pages, align, 0);
 	if (!p) {
 		ss_span_free(s);
@@ -1190,6 +1247,147 @@ done:
 	ps_lock_release(&mm_lock);
 
 	return ret;
+}
+
+/* Order pages by frame address */
+static int
+mm_page_cmp(const void *a, const void *b)
+{
+	const struct mm_page *pa = *(struct mm_page * const *)a, *pb = *(struct mm_page * const *)b;
+
+	return (pa->page > pb->page) - (pa->page < pb->page);
+}
+
+/* Free heap page p of c (already unlinked from the heap hash), unmapped before ts */
+static void
+mm_heap_page_release(struct cm_comp *c, struct mm_page *p, u64_t ts)
+{
+	if (c->va_pinned) mm_va_put(c, p->mappings[0].addr, 1, ts);
+	mm_frames_put(p->page, 1, ts);
+	ss_state_free(&p->mappings[0].comp);
+	mm_page_meta_free(p);
+}
+
+/* Heap pages to sort in mm_comp_release (protected by mm_lock) */
+#define MM_RELEASE_SORT (1 << 16)
+static struct mm_page *mm_release_pages[MM_RELEASE_SORT];
+
+/*
+ * Release all of the memory mapped into component c by the memmgr
+ * interface (its heap pages, and its mappings of shared memory), as
+ * c is stopped. The frames (and the shared memory whose last mapping
+ * c had) are reused once all cores have flushed their TLBs, which we
+ * wait for here, so that c can be started again (and reuse its
+ * addresses) right away.
+ *
+ * c's addresses are all free once its memory is released, so they
+ * are all reused (mm_va_get) from the beginning, as a single range,
+ * unless c has memory that is never released (contiguous memory, or
+ * device memory), in which case only the released ranges are.
+ *
+ * Returns the number of pages released.
+ */
+static unsigned long
+mm_comp_release(struct cm_comp *c)
+{
+	struct cos_compinfo *ci = cos_compinfo_get(c->comp.comp_res);
+	struct mm_page *p, *next;
+	struct mm_span *s;
+	struct mm_run  *r;
+	unsigned int   *id;
+	unsigned long   h, i, slot, nheap = 0, nshared = 0;
+	vaddr_t         frontier;
+	u64_t ts;
+
+	ps_lock_take(&mm_lock);
+
+	/* First all of the unmaps... */
+	for (h = 0; h < MM_HASH_SZ; h++) {
+		for (id = &mm_heap_hash[h]; *id; id = &p->hnext) {
+			p = ss_page_get(*id);
+			if (mm_mapping_comp(&p->mappings[0]) != c) continue;
+			if (mm_unmap(c, p->mappings[0].addr)) BUG();
+		}
+	}
+	for (i = 1; i <= mm_span_hw; i++) {
+		s = ss_span_get(i);
+		if (!s) continue;
+		p = ss_page_get(s->page_off);
+		for (slot = 0; slot < MM_MAPPINGS_MAX; slot++) {
+			if (mm_mapping_comp(&p->mappings[slot]) != c) continue;
+			for (next = p; next; next = mm_span_page_next(next)) {
+				if (mm_unmap(c, next->mappings[slot].addr)) BUG();
+			}
+		}
+	}
+	/* ...then the shootdown, and the memory is freed once it completes */
+	ts = mm_shootdown();
+
+	/*
+	 * The heap pages are found in hash order: sort them (by frame)
+	 * so that contiguous frames are freed as a single run that can
+	 * be reused for multi-page allocations. Beyond the capacity of
+	 * the sort array, the pages are freed unsorted.
+	 */
+	for (h = 0; h < MM_HASH_SZ; h++) {
+		for (id = &mm_heap_hash[h]; *id; ) {
+			p = ss_page_get(*id);
+			if (mm_mapping_comp(&p->mappings[0]) != c) {
+				id = &p->hnext;
+				continue;
+			}
+			*id = p->hnext;
+			if (nheap < MM_RELEASE_SORT) mm_release_pages[nheap] = p;
+			else                         mm_heap_page_release(c, p, ts);
+			nheap++;
+		}
+	}
+	qsort(mm_release_pages, nheap < MM_RELEASE_SORT ? nheap : MM_RELEASE_SORT, sizeof(struct mm_page *), mm_page_cmp);
+	for (i = 0; i < nheap && i < MM_RELEASE_SORT; i++) mm_heap_page_release(c, mm_release_pages[i], ts);
+	for (i = 1; i <= mm_span_hw; i++) {
+		s = ss_span_get(i);
+		if (!s) continue;
+		p = ss_page_get(s->page_off);
+		for (slot = 0; slot < MM_MAPPINGS_MAX; slot++) {
+			if (mm_mapping_comp(&p->mappings[slot]) != c) continue;
+			if (c->va_pinned) mm_va_put(c, p->mappings[slot].addr, s->n_pages, ts);
+			for (next = p; next; next = mm_span_page_next(next)) ss_state_free(&next->mappings[slot].comp);
+			nshared += s->n_pages;
+			if (--s->nmaps > 0) continue;
+
+			/* c had the last mapping: free the memory and the span */
+			for (; p; p = next) {
+				next = mm_span_page_next(p);
+				mm_frames_put(p->page, 1, ts);
+				mm_page_meta_free(p);
+			}
+			mm_stats.freed += s->n_pages;
+			ss_span_free(s);
+			break;
+		}
+	}
+	mm_stats.freed += nheap;
+
+	if (!c->va_pinned) {
+		/*
+		 * Nothing is mapped at the addresses we gave c anymore:
+		 * they are all free, as a single range.
+		 */
+		while ((r = c->va_free.head)) {
+			mm_runlist_remove(&c->va_free, r, NULL);
+			mm_run_free(r);
+		}
+		ps_lock_take(&ci->va_lock);
+		frontier = ci->vas_frontier;
+		ps_lock_release(&ci->va_lock);
+		if (frontier > c->heap_start) mm_va_put(c, c->heap_start, (frontier - c->heap_start) / PAGE_SIZE, ts);
+	}
+
+	/* The TLB quiescence of c's addresses, and of the frames */
+	while (!mm_quiescent(ts)) ;
+	ps_lock_release(&mm_lock);
+
+	return nheap + nshared;
 }
 
 static compid_t
@@ -1424,6 +1622,8 @@ capmgr_thd_create_ext(spdid_t client, thdclosure_index_t idx, thdid_t *tid)
 
 	s = ss_comp_get(schedid);
 	if (!c || !s) return 0;
+	/* Components started at runtime only have threads while running */
+	if (c->deferred != CM_DEFERRED_NONE && c->deferred != CM_DEFERRED_RUNNING) return 0;
 	t = cm_thd_alloc_in(c, s, idx);
 	if (!t) {
 		/* TODO: release resources */
@@ -1593,6 +1793,125 @@ done:
 	return ret;
 }
 
+/***
+ * Components started at runtime (`boot = "deferred"`).
+ *
+ * The booter creates them at boot (resource tables, memory image,
+ * and invocations) and delegates their resource tables to us like for
+ * all components, but their scheduler doesn't initialize them, and
+ * the invocations to them are deactivated. Their scheduler starts
+ * them (`loader_comp_start`) by asking us to load them
+ * (capmgr_comp_start, which has the booter reset their image and
+ * activate the invocations to them), then creating their
+ * initialization thread. To stop them, the scheduler deletes their
+ * threads, and we deactivate the invocations to them, and release
+ * their memory (capmgr_comp_stop). Their resource tables (and all
+ * other capabilities in them, such as their invocations to their
+ * servers) are kept, and reused the next time they are started.
+ */
+
+/* Return deferred component id if the caller is its scheduler, or NULL with the error in *err */
+static struct cm_comp *
+cm_deferred_get(compid_t id, int *err)
+{
+	compid_t caller = (compid_t)cos_inv_token();
+	struct cm_comp *c = ss_comp_get(id);
+
+	*err = -EINVAL;
+	if (!c || c->deferred == CM_DEFERRED_NONE) return NULL;
+	*err = -EPERM;
+	if (capmgr_comp_sched_get(id) != caller) return NULL;
+
+	return c;
+}
+
+int
+capmgr_comp_start(compid_t id)
+{
+	struct cm_comp *c;
+	int ret;
+
+	c = cm_deferred_get(id, &ret);
+	if (!c) return ret;
+	if (!ps_cas(&c->deferred, CM_DEFERRED_STOPPED, CM_DEFERRED_STARTING)) return -EBUSY;
+
+	/* The booter resets its memory, and enables invocations to it */
+	ret = addr_comp_load(id);
+	ps_store(&c->deferred, ret ? CM_DEFERRED_STOPPED : CM_DEFERRED_RUNNING);
+
+	return ret;
+}
+
+int
+capmgr_comp_stop(compid_t id)
+{
+	struct cm_comp *c;
+	struct cm_thd  *t;
+	int i, ret;
+
+	c = cm_deferred_get(id, &ret);
+	if (!c) return ret;
+	if (!ps_cas(&c->deferred, CM_DEFERRED_RUNNING, CM_DEFERRED_STOPPING)) return -EBUSY;
+
+	/*
+	 * The scheduler must have released all of its threads. The
+	 * threads it created for itself (capmgr_thd_create), that only
+	 * it has the capability for, are released here (they must be
+	 * on this core).
+	 */
+	ps_lock_take(&cm_lock);
+	for (i = 1; i <= MAX_NUM_THREADS; i++) {
+		t = ss_thd_get(i);
+		if (!t || t->client != c) continue;
+		if (t->sched != c || t->core != cos_cpuid()) break;
+	}
+	if (i > MAX_NUM_THREADS) {
+		for (i = 1; i <= MAX_NUM_THREADS; i++) {
+			t = ss_thd_get(i);
+			if (!t || t->client != c) continue;
+			if (crt_cap_alias_free(&c->comp, t->aliased_cap, CAP_THD) || crt_thd_free(&t->thd)) BUG();
+			ss_thd_free(t);
+		}
+		i = 0;
+	}
+	ps_lock_release(&cm_lock);
+	if (i) {
+		ps_store(&c->deferred, CM_DEFERRED_RUNNING);
+		return -EBUSY;
+	}
+
+	/* No more invocations of it... */
+	if ((ret = addr_comp_unload(id))) {
+		printc("capmgr: the booter could not unload component %lu (err %d).\n", (unsigned long)id, ret);
+		ps_store(&c->deferred, CM_DEFERRED_RUNNING);
+		return ret;
+	}
+	/* ...so its memory can go */
+	mm_comp_release(c);
+	ps_store(&c->deferred, CM_DEFERRED_STOPPED);
+
+	return 0;
+}
+
+static void
+capmgr_deferred_init(void)
+{
+	struct initargs entries, curr;
+	struct initargs_iter i;
+	int cont, keylen;
+
+	if (args_get_entry("deferred", &entries)) return;
+	for (cont = args_iter(&entries, &i, &curr); cont; cont = args_iter_next(&i, &curr)) {
+		compid_t id = atoi(args_key(&curr, &keylen));
+		struct cm_comp *c = ss_comp_get(id);
+
+		assert(c);
+		c->deferred   = CM_DEFERRED_STOPPED;
+		c->heap_start = cos_compinfo_get(c->comp.comp_res)->vas_frontier;
+		printc("\tComponent %s (%lu) is started at runtime.\n", args_value(&curr), (unsigned long)id);
+	}
+}
+
 static struct cm_thd *
 capmgr_get_thd(thdid_t tid)
 {
@@ -1644,6 +1963,7 @@ capmgr_shared_kernel_page_create(vaddr_t *resource)
 {
 	struct cm_comp *c = ss_comp_get(cos_inv_token());
 	assert(c);
+	c->va_pinned = 1;	/* never unmapped */
 
 	return crt_comp_shared_kernel_page_alloc(&c->comp, resource);
 }
@@ -1778,6 +2098,7 @@ cos_init(void)
 	cos_kmem_reclaim_init(ci, &cm_kmem_reclaim);
 	/* Initialize the other component's for which we're responsible */
 	capmgr_comp_init();
+	capmgr_deferred_init();
 
 	/* Reserve some continuous pages */
 	contig_phy_pages = crt_page_allocn(&cm_self()->comp, CONTIG_PHY_PAGES);

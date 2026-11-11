@@ -40,10 +40,29 @@ Run descriptors (`MM_NRUNS`) and the reclamation rings are statically sized; if 
 `contigmem_alloc` memory and memory mapped into VMs with `memmgr_shared_page_map_aligned_in_vm` (no unmap for VMs) are not reclaimed.
 The capmgr's locks are spinlocks (see the warning in the code).
 
+### Components started at runtime
+
+Components marked `boot = "deferred"` in the composition script are started and stopped at runtime through their scheduler's `loader` interface (see `sched.pfprr_quantum_static`), which uses `capmgr_comp_start` and `capmgr_comp_stop`.
+Only the component's scheduler (its `init_hierarchy` entry) can call them, and only for the components in our `deferred` initargs.
+
+The booter creates deferred components at boot like all others (resource tables, memory image, and the synchronous invocations from and to them), and delegates their resource tables to us, but the invocations of their functions by their clients are redirected to a booter function that returns `-ENOENT` until they are started.
+Stopping one does not tear it down: its capability table, page-table, component capability, memory image, and its own invocations to its servers are kept, and reused when it is started again.
+
+- `capmgr_comp_start` has the booter load the component (`addr_comp_load`): reset its memory image from its elf object (including the client side, ucaps, of its invocations), and point its clients' invocations to it again.
+    The scheduler then creates its initialization thread (`capmgr_thd_create_ext`, which refuses to create threads in a deferred component that isn't running).
+- `capmgr_comp_stop` requires that the scheduler has released the component's threads (`capmgr_thd_release`); the threads the component created for itself with `capmgr_thd_create` are released here.
+    It then has the booter redirect the invocations to the component (`addr_comp_unload`), and releases all memory mapped into it through the `memmgr` interface: its heap pages, and its mappings of shared memory (the memory itself is freed if it had the last mapping).
+    The heap pages are freed in frame order so that contiguous frames can again satisfy multi-page allocations.
+    It waits for the TLB quiescence of the released memory, so that the component's addresses can be reused immediately: all of them, as one range, as nothing remains mapped, unless the component has memory that is never released (`contigmem`, device memory, shared kernel pages), in which case only the released ranges are reused.
+
+What is not released when a component is stopped: its resource tables (kept for reuse, so repeated stop/start cycles don't consume resources), contiguous and device memory it allocated, and any state other servers keep for it (e.g. scheduler block points, which are allocate-only).
+Loading a component that is not in the system image (not known at compose time) is not supported: the booter only has the images of the components in the composition script.
+
 ### Component teardown (not implemented)
 
 Tearing down a component (e.g. `capmgr_comp_terminate(compid)`, for crash recovery or unloading) is not implemented.
-What it needs, in order:
+Stopping a deferred component (above) avoids most of what follows by keeping the component's resource tables, by requiring that it has no active invokers, and because its invocations are recorded by the booter.
+What a general teardown needs, in order:
 
 1. *Stop execution in it.*
     Its scheduler must delete all threads that *begin* in the component (`sched_thd_delete`), and the rcvs/asnds created for it (`capmgr_rcv_release`).

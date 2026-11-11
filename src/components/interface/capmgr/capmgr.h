@@ -74,6 +74,32 @@ int COS_STUB_DECL(capmgr_thd_release)(thdid_t tid);
 int capmgr_rcv_release(thdid_t tid);
 int COS_STUB_DECL(capmgr_rcv_release)(thdid_t tid);
 
+/*
+ * Start and stop components at runtime (`boot = "deferred"` in the
+ * composition script), on behalf of their scheduler, which must be
+ * the caller (see the `loader` interface it implements).
+ *
+ * capmgr_comp_start loads the component (resets its memory image and
+ * enables the invocations to it, through the booter), after which
+ * the scheduler can create its initialization thread.
+ *
+ * capmgr_comp_stop requires that the scheduler has already released
+ * all of the component's threads (capmgr_thd_release). It disables
+ * the invocations to the component (they then fail with -ENOENT),
+ * then releases all of the memory mapped into it by the memmgr
+ * interface (heap pages, and its mappings of shared memory), and
+ * waits until that memory can be reused.
+ *
+ * Both return 0 on success, -EPERM if the caller isn't the
+ * component's scheduler, -EINVAL if it isn't a deferred component,
+ * -EBUSY if it is already started (or stopped), or, for stop, still
+ * has threads.
+ */
+int capmgr_comp_start(compid_t id);
+int COS_STUB_DECL(capmgr_comp_start)(compid_t id);
+int capmgr_comp_stop(compid_t id);
+int COS_STUB_DECL(capmgr_comp_stop)(compid_t id);
+
 asndcap_t capmgr_asnd_create(spdid_t child, thdid_t t);
 asndcap_t COS_STUB_DECL(capmgr_asnd_create)(spdid_t child, thdid_t t);
 
